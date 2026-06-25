@@ -108,48 +108,14 @@ async function resolveModel(clientModel) {
   return { modelId: 'auto', providerModelId: 'auto' };
 }
 
-// ---------- 会话粘合 ----------
-// OpenAI/Claude API 是无状态的 (客户端每次发完整 messages),
-// 但 Langdock 是有状态的 (会话 ID 维护上下文).
-// 我们用消息内容哈希做 sessionKey, 同一对话复用同一个 Langdock 会话.
-//
-// 映射: sessionKey → { convId, lastMsgId, msgCount }
-const sessions = new Map();
-// 清理超过 2 小时没活动的会话, 避免内存泄漏
-const SESSION_TTL = 2 * 60 * 60 * 1000;
-
-function sessionKey(messages) {
-  // 用第一条 user 消息的内容做 key (跳过 system, 因为 system 可能变化或每次相同)
-  // 同一对话的第一条 user 不会变, 后续请求都能匹配
-  const firstUser = messages.find(m => m.role === 'user') || messages[0];
-  const firstContent = typeof firstUser?.content === 'string' ? firstUser.content : JSON.stringify(firstUser?.content || '');
-  return crypto.createHash('sha256').update('user::' + firstContent).digest('hex').slice(0, 16);
-}
-
-function getSession(key) {
-  const s = sessions.get(key);
-  if (s && (Date.now() - s.lastActive) < SESSION_TTL) return s;
-  return null;
-}
-
-function setSession(key, convId, lastMsgId, msgCount) {
-  sessions.set(key, { convId, lastMsgId, msgCount, lastActive: Date.now() });
-}
-
-// 清理过期会话 (每次调用时顺便检查)
-function cleanSessions() {
-  const now = Date.now();
-  for (const [k, s] of sessions) {
-    if (now - s.lastActive > SESSION_TTL) sessions.delete(k);
-  }
-}
-
 // ---------- 解析单行 Vercel AI SDK SSE → 文本 ----------
-// Langdock 流式格式: 每行 0:"text chunk" 或 d:{"finishReason":"stop"}
+// 支持三种格式:
+//   0:"text" (Vercel AI SDK)
+//   data: {"type":"text-delta","delta":"text"} (Opus extendedThinking)
+//   data: {"text":"..."} 或 {"content":"..."} (传统)
 function parseVercelLine(line) {
   const trimmed = line.trim();
   if (!trimmed || trimmed.startsWith(':')) return null;
-
   // Vercel AI SDK: 0:"text" / d:{...}
   const m = trimmed.match(/^(\d+|d):\s*(.*)$/);
   if (m) {
@@ -158,7 +124,6 @@ function parseVercelLine(line) {
     }
     return null;
   }
-
   // 传统 SSE: data: {...}
   const dm = trimmed.match(/^data:\s*(.*)$/);
   if (dm) {
@@ -166,148 +131,118 @@ function parseVercelLine(line) {
     if (payload === '[DONE]' || payload === '') return null;
     try {
       const obj = JSON.parse(payload);
+      // text-delta (Opus 4.8 extendedThinking)
+      if (obj.type === 'text-delta' && obj.delta) return obj.delta;
       return obj.text || obj.delta || obj.content || '';
     } catch {}
   }
   return null;
 }
 
+// 从 SSE 行里提取 data-conversation-id
+function parseConvId(line) {
+  try {
+    const m = line.match(/"data-conversation-id","data":"([^"]*)"/);
+    return m ? m[1] : null;
+  } catch { return null; }
+}
+
+// ---------- 会话复用 ----------
+// Langdock 服务端通过 convId 关联对话历史
+// 浏览器行为: 续接时只发新消息, 但用正确的 parentId 链接上一轮 assistant
+// threadId 始终 = 第一条消息的 id, parentId = 上一轮 assistant 的 messageId
+const convSessions = new Map(); // sessionKey → { convId, threadId, assistantMsgId, time }
+const CONV_TTL = 2 * 60 * 60 * 1000;
+
+function getSessionKey(messages) {
+  const firstUser = messages.find(m => m.role === 'user') || messages[0];
+  const content = typeof firstUser?.content === 'string' ? firstUser.content : JSON.stringify(firstUser?.content || '');
+  return crypto.createHash('sha256').update('u::' + content).digest('hex').slice(0, 16);
+} // 2小时过期
+
 // ---------- 调 Langdock /api/engine ----------
-// streamMode=true + onChunk: 流式, 逐块回调
-// 否则: 收集完整响应
+// 注意: Langdock API 每次请求都是独立的单轮对话
+// 它只处理 messages 数组里的最后一条消息, 不处理完整历史
+// 多轮对话上下文无法通过 API 传递 (Langdock 服务端维护, 仅浏览器 session 可用)
 async function callLangdock(messages, langdockModel, streamMode, onChunk) {
-  // langdockModel = { id, providerModelId, provider, displayName } 从 resolveModel 来
-  // 指定模型: modelSelection = { kind: "modelId", modelId: <uuid> }
-  // auto: modelSelection = { kind: "auto" }
   const isSpecific = langdockModel && langdockModel.id && langdockModel.id !== 'auto';
   const modelId = langdockModel?.id || 'auto';
   const modelProvider = langdockModel?.provider || null;
   const modelName = langdockModel?.displayName || null;
+  if (!LANGDOCK_COOKIE) throw new Error('LANGDOCK_COOKIE 未设置');
 
-  cleanSessions();
-  const key = sessionKey(messages);
-  const existing = getSession(key);
+  const convId = uuid();
+  const threadId = uuid();
 
-  // 会话粘合逻辑:
-  //   - 新会话: 发全部 messages
-  //   - 已有会话: 只发最后一条新消息, parentId 指向上次的 lastMsgId
-  //   - 如果已有会话但消息数没增加 (重发), 还是发全部
-  let convId, parentId, msgToSend;
+  // 只发最后一条消息 (Langdock API 只处理单条)
+  const newMsg = messages[messages.length - 1];
+  const msgId = uuid();
+  const ldMessages = [{
+    id: msgId,
+    role: newMsg.role === 'system' ? 'user' : newMsg.role,
+    parts: [{ type: 'text', text: newMsg.content || '' }],
+    metadata: {
+      createdAt: new Date().toISOString(),
+      threadId,
+      parentId: uuid(),
+      selectedTool: null, selectedInternalSearchIntegrations: [], attachments: [],
+      taggedIntegrations: [], taggedKnowledgeFolders: [], taggedWorkflows: [],
+      taggedAssistantId: null,
+      modelId: isSpecific ? modelId : null,
+      modelProvider: isSpecific ? modelProvider : null,
+      modelName: isSpecific ? modelName : null,
+      userFeedback: null,
+    },
+  }];
 
-  if (existing && messages.length > existing.msgCount) {
-    // 续接: 复用 convId, 只发新消息
-    convId = existing.convId;
-    parentId = existing.lastMsgId;
-    msgToSend = [messages[messages.length - 1]]; // 只发最后一条
-    log(`续接会话 ${convId.slice(0,8)}, parentId=${parentId.slice(0,8)}, 发 ${msgToSend.length} 条新消息`);
-  } else {
-    // 新会话或重发: 全新 convId, 发全部
-    convId = uuid();
-    parentId = uuid();
-    msgToSend = messages;
-    log(`新会话 ${convId.slice(0,8)}, 发 ${msgToSend.length} 条消息`);
-  }
+  const body = JSON.stringify({
+    id: convId,
+    conversationSource: 'WEB',
+    userTimezone: 'Asia/Shanghai',
+    modelSelection: isSpecific ? { kind: 'modelId', modelId: modelId } : { kind: 'auto' },
+    extendedThinking: true,
+    messages: ldMessages,
+  });
 
   return new Promise((resolve, reject) => {
-    if (!LANGDOCK_COOKIE) return reject(new Error('LANGDOCK_COOKIE 未设置'));
-
     const url = new URL(LANGDOCK_BASE + '/api/engine');
-    const threadId = convId; // threadId = convId, 保持一致
-
-    const ldMessages = msgToSend.map((m, i) => {
-      const isLast = i === msgToSend.length - 1;
-      const msgId = uuid();
-      return {
-        id: msgId,
-        role: m.role === 'system' ? 'user' : m.role,
-        parts: [{ type: 'text', text: m.content || '' }],
-        metadata: isLast ? {
-          createdAt: new Date().toISOString(),
-          threadId, parentId,
-          selectedTool: null,
-          selectedInternalSearchIntegrations: [],
-          attachments: [],
-          taggedIntegrations: [],
-          taggedKnowledgeFolders: [],
-          taggedWorkflows: [],
-          taggedAssistantId: null,
-          modelId: isSpecific ? modelId : null,
-          modelProvider: isSpecific ? modelProvider : null,
-          modelName: isSpecific ? modelName : null,
-          userFeedback: null,
-        } : {
-          createdAt: new Date().toISOString(),
-          threadId, parentId,
-        },
-      };
-    });
-
-    // 记下最后一条消息的 id, 用于下次续接
-    const lastMsgId = ldMessages[ldMessages.length - 1].id;
-
-    const body = JSON.stringify({
-      id: convId,
-      conversationSource: 'WEB',
-      userTimezone: 'Asia/Shanghai',
-      // 指定模型: kind=modelId + modelId=<uuid>; auto: kind=auto
-      modelSelection: isSpecific
-        ? { kind: 'modelId', modelId: modelId }
-        : { kind: 'auto' },
-      extendedThinking: true,
-      messages: ldMessages,
-    });
-
     const req = https.request({
-      method: 'POST',
-      hostname: url.hostname,
-      path: url.pathname,
+      method: 'POST', hostname: url.hostname, path: url.pathname,
       headers: {
         'Content-Type': 'application/json',
         'Cookie': LANGDOCK_COOKIE,
         'Origin': LANGDOCK_BASE,
         'Referer': LANGDOCK_BASE + '/chat/' + convId,
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
-        'Accept': '*/*',
-        'Accept-Language': 'zh-CN,zh;q=0.9',
+        'Accept': '*/*', 'Accept-Language': 'zh-CN,zh;q=0.9',
         'x-app-version': 'v7.17.0',
         'sec-ch-ua': '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"macOS"',
-        'sec-fetch-dest': 'empty',
-        'sec-fetch-mode': 'cors',
-        'sec-fetch-site': 'same-origin',
-        'dnt': '1',
+        'sec-ch-ua-mobile': '?0', 'sec-ch-ua-platform': '"macOS"',
+        'sec-fetch-dest': 'empty', 'sec-fetch-mode': 'cors', 'sec-fetch-site': 'same-origin', 'dnt': '1',
       },
     }, (res) => {
       const ct = res.headers['content-type'] || '';
-
-      // 流式模式: 逐行解析 Langdock SSE, 通过 onChunk 回调转发给客户端
       if (streamMode && onChunk && res.statusCode < 400) {
         let buf = '';
         res.on('data', (c) => {
           buf += c.toString('utf8');
-          // 按行处理 (SSE 每行一个事件)
           const lines = buf.split('\n');
-          buf = lines.pop(); // 最后一行可能不完整, 留着
+          buf = lines.pop();
           for (const line of lines) {
             const text = parseVercelLine(line);
             if (text) onChunk(text);
           }
         });
         res.on('end', () => {
-          // 处理剩余
           if (buf) {
             const text = parseVercelLine(buf);
             if (text) onChunk(text);
           }
-          if (res.statusCode < 400) setSession(key, convId, lastMsgId, messages.length);
           resolve({ status: res.statusCode, contentType: ct, body: '', done: true });
         });
         res.on('error', reject);
         return;
       }
-
-      // 非流式: 收集完整响应
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => {
@@ -315,11 +250,8 @@ async function callLangdock(messages, langdockModel, streamMode, onChunk) {
         if (DEBUG) {
           console.log('\n[bridge] === Langdock 响应 ===');
           console.log('  status:', res.statusCode, 'ct:', ct);
-          console.log('  body (前 800):', full.slice(0, 800));
+          console.log('  body (前 500):', full.slice(0, 500));
           console.log('[bridge] === end ===\n');
-        }
-        if (res.statusCode < 400) {
-          setSession(key, convId, lastMsgId, messages.length);
         }
         resolve({ status: res.statusCode, contentType: ct, body: full });
       });
