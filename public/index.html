@@ -66,6 +66,19 @@
 
   .empty { text-align: center; color: #b2bec3; padding: 60px 20px; }
   .empty p { font-size: 14px; margin-top: 8px; }
+
+  /* 标签页按钮 */
+  .tab-btn { padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; background: #e9ecef; color: #495057; }
+  .tab-btn.active { background: #0984e3; color: #fff; }
+  .tab-btn:hover:not(.active) { background: #dee2e6; }
+
+  /* 日志表格 */
+  .log-table th { font-weight: 600; font-size: 12px; color: #6c757d; text-transform: uppercase; letter-spacing: 0.5px; }
+  .log-table td { padding: 10px 12px; border-bottom: 1px solid #f1f3f5; vertical-align: middle; }
+  .log-table tr:hover { background: #f8f9fa; }
+
+  /* 状态徽章 */
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -83,15 +96,56 @@
 <div id="main" style="display:none;">
   <div class="container">
     <div class="header">
-      <h1>代理管理</h1>
+      <h1>Langdock 管理</h1>
       <div class="actions">
-        <button class="btn-primary" onclick="openCreateModal()">+ 新建代理</button>
         <button class="btn-logout" onclick="logout()">退出</button>
       </div>
     </div>
-    <div class="proxy-list" id="proxyList"></div>
-    <div class="empty" id="emptyState" style="display:none;">
-      <p>还没有代理，点击「新建代理」创建第一个</p>
+
+    <!-- 标签页导航 -->
+    <div class="tabs" style="display:flex;gap:8px;margin-bottom:20px;">
+      <button class="tab-btn active" onclick="switchTab('proxies', this)" id="tabProxies">代理管理</button>
+      <button class="tab-btn" onclick="switchTab('logs', this)" id="tabLogs">调用日志</button>
+    </div>
+
+    <!-- 代理管理页 -->
+    <div id="pageProxies">
+      <div style="margin-bottom:16px;">
+        <button class="btn-primary" onclick="openCreateModal()">+ 新建代理</button>
+      </div>
+      <div class="proxy-list" id="proxyList"></div>
+      <div class="empty" id="emptyState" style="display:none;">
+        <p>还没有代理，点击「新建代理」创建第一个</p>
+      </div>
+    </div>
+
+    <!-- 调用日志页 -->
+    <div id="pageLogs" style="display:none;">
+      <div class="log-stats" id="logStats" style="display:flex;gap:16px;margin-bottom:16px;flex-wrap:wrap;"></div>
+      <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;">
+        <button class="btn-primary btn-sm" onclick="refreshLogs()">刷新</button>
+        <label style="font-size:12px;color:#636e72;">
+          <input type="checkbox" id="autoRefreshLogs" onchange="toggleAutoRefresh()"> 自动刷新 (3秒)
+        </label>
+      </div>
+      <div class="log-table-wrapper" style="background:#fff;border-radius:10px;overflow:auto;max-height:70vh;">
+        <table class="log-table" id="logTable" style="width:100%;border-collapse:collapse;font-size:13px;">
+          <thead>
+            <tr style="background:#f8f9fa;position:sticky;top:0;">
+              <th style="padding:10px 12px;text-align:left;border-bottom:1px solid #e9ecef;">时间</th>
+              <th style="padding:10px 12px;text-align:left;border-bottom:1px solid #e9ecef;">端点</th>
+              <th style="padding:10px 12px;text-align:left;border-bottom:1px solid #e9ecef;">模型</th>
+              <th style="padding:10px 12px;text-align:center;border-bottom:1px solid #e9ecef;">消息数</th>
+              <th style="padding:10px 12px;text-align:center;border-bottom:1px solid #e9ecef;">流式</th>
+              <th style="padding:10px 12px;text-align:center;border-bottom:1px solid #e9ecef;">状态</th>
+              <th style="padding:10px 12px;text-align:right;border-bottom:1px solid #e9ecef;">耗时</th>
+              <th style="padding:10px 12px;text-align:left;border-bottom:1px solid #e9ecef;">响应预览</th>
+            </tr>
+          </thead>
+          <tbody id="logBody"></tbody>
+        </table>
+      </div>
+      <div id="logEmpty" class="empty" style="display:none;"><p>暂无调用日志</p></div>
     </div>
   </div>
 </div>
@@ -355,6 +409,88 @@ async function refreshLogs() {
 function closeLogs() {
   document.getElementById('logsPanel').classList.remove('active');
   currentLogsId = null;
+}
+
+// ---------- 标签页切换 ----------
+let currentTab = 'proxies';
+function switchTab(tab, btn) {
+  currentTab = tab;
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('pageProxies').style.display = tab === 'proxies' ? 'block' : 'none';
+  document.getElementById('pageLogs').style.display = tab === 'logs' ? 'block' : 'none';
+  if (tab === 'logs') refreshLogs();
+}
+
+// ---------- 调用日志 ----------
+let logAutoRefreshTimer = null;
+
+function toggleAutoRefresh() {
+  if (document.getElementById('autoRefreshLogs').checked) {
+    logAutoRefreshTimer = setInterval(refreshLogs, 3000);
+  } else {
+    clearInterval(logAutoRefreshTimer);
+    logAutoRefreshTimer = null;
+  }
+}
+
+async function refreshLogs() {
+  try {
+    const data = await api('GET', '/bridge/logs?limit=200');
+    // 统计
+    const stats = data.stats || {};
+    const statsEl = document.getElementById('logStats');
+    statsEl.innerHTML = `
+      <div style="background:#fff;padding:12px 16px;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,0.06);">
+        <div style="font-size:11px;color:#6c757d;">总调用</div>
+        <div style="font-size:20px;font-weight:600;">${stats.total || 0}</div>
+      </div>
+      <div style="background:#fff;padding:12px 16px;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,0.06);">
+        <div style="font-size:11px;color:#28a745;">成功</div>
+        <div style="font-size:20px;font-weight:600;color:#28a745;">${stats.success || 0}</div>
+      </div>
+      <div style="background:#fff;padding:12px 16px;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,0.06);">
+        <div style="font-size:11px;color:#dc3545;">失败</div>
+        <div style="font-size:20px;font-weight:600;color:#dc3545;">${stats.errors || 0}</div>
+      </div>
+      <div style="background:#fff;padding:12px 16px;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,0.06);">
+        <div style="font-size:11px;color:#6c757d;">平均耗时</div>
+        <div style="font-size:20px;font-weight:600;">${stats.avgDuration || 0}ms</div>
+      </div>
+    `;
+    // 日志表格
+    const logs = data.logs || [];
+    const tbody = document.getElementById('logBody');
+    const empty = document.getElementById('logEmpty');
+    if (logs.length === 0) {
+      tbody.innerHTML = '';
+      empty.style.display = 'block';
+      return;
+    }
+    empty.style.display = 'none';
+    tbody.innerHTML = logs.map(l => {
+      const time = l.timestamp ? new Date(l.timestamp).toLocaleTimeString() : '-';
+      const statusBadge = l.status === 'success'
+        ? '<span class="badge" style="background:#d4edda;color:#155724;">成功</span>'
+        : l.status === 'error'
+        ? '<span class="badge" style="background:#f8d7da;color:#721c24;">失败</span>'
+        : '<span class="badge" style="background:#fff3cd;color:#856404;">进行中</span>';
+      const preview = l.responsePreview ? escapeHtml(l.responsePreview).slice(0, 80) : (l.error ? '<span style="color:#dc3545;">' + escapeHtml(l.error).slice(0, 80) + '</span>' : '-');
+      const endpoint = (l.endpoint || '').replace('/v1/', '');
+      return `<tr>
+        <td style="font-family:monospace;font-size:12px;">${time}</td>
+        <td><code style="font-size:11px;background:#f1f3f5;padding:2px 6px;border-radius:3px;">${endpoint}</code></td>
+        <td>${escapeHtml(l.model || '-')}</td>
+        <td style="text-align:center;">${l.messageCount || '-'}</td>
+        <td style="text-align:center;">${l.stream ? '✓' : '-'}</td>
+        <td style="text-align:center;">${statusBadge}</td>
+        <td style="text-align:right;font-family:monospace;">${l.duration || 0}ms</td>
+        <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${preview}</td>
+      </tr>`;
+    }).join('');
+  } catch (e) {
+    console.error('load logs error:', e);
+  }
 }
 
 // ---------- 初始化 ----------
