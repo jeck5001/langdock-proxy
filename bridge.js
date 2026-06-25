@@ -27,6 +27,32 @@ function log(...args) {
   if (DEBUG) console.log('[bridge]', ...args);
 }
 
+// ---------- 调用日志 ----------
+// 存储最近的调用记录，供 Web UI 查看
+const MAX_LOGS = 1000;
+const callLogs = [];
+
+function addCallLog(entry) {
+  entry.timestamp = new Date().toISOString();
+  callLogs.unshift(entry);
+  if (callLogs.length > MAX_LOGS) callLogs.pop();
+  return entry;
+}
+
+function getCallLogs(limit = 100, offset = 0) {
+  return callLogs.slice(offset, offset + limit);
+}
+
+function getCallLogStats() {
+  const total = callLogs.length;
+  const success = callLogs.filter(l => l.status === 'success').length;
+  const errors = callLogs.filter(l => l.status === 'error').length;
+  const avgDuration = total > 0
+    ? Math.round(callLogs.reduce((sum, l) => sum + (l.duration || 0), 0) / total)
+    : 0;
+  return { total, success, errors, avgDuration };
+}
+
 // ---------- 模型缓存 ----------
 // 从 Langdock /api/models 拉取, 缓存 10 分钟
 let modelsCache = null;
@@ -358,6 +384,21 @@ function toClaudeResponse(text, model) {
 // ---------- Express Router ----------
 const router = express.Router();
 
+// 日志查询 API
+router.get('/logs', (req, res) => {
+  const limit = parseInt(req.query.limit) || 100;
+  const offset = parseInt(req.query.offset) || 0;
+  res.json({
+    logs: getCallLogs(limit, offset),
+    total: callLogs.length,
+    stats: getCallLogStats(),
+  });
+});
+
+router.get('/logs/stats', (req, res) => {
+  res.json(getCallLogStats());
+});
+
 // 模型列表 (动态从 Langdock 拉取)
 router.get('/v1/models', async (req, res) => {
   try {
@@ -381,8 +422,24 @@ router.get('/v1/models', async (req, res) => {
 router.post('/v1/chat/completions', async (req, res) => {
   const { messages, model, stream } = req.body || {};
   if (!messages) return res.status(400).json({ error: { message: 'messages required' } });
+
+  const startTime = Date.now();
+  const logEntry = addCallLog({
+    id: uuid().slice(0, 8),
+    endpoint: '/v1/chat/completions',
+    model: model || 'auto',
+    messageCount: messages.length,
+    stream: !!stream,
+    status: 'pending',
+    duration: 0,
+    responsePreview: '',
+    error: null,
+  });
+
   try {
     const lm = await resolveModel(model);
+    logEntry.model = lm.displayName || lm.providerModelId || model;
+    logEntry.modelId = lm.id;
     log(`/v1/chat/completions model=${model} → ${lm.providerModelId} msgs=${messages.length} stream=${stream}`);
 
     if (stream) {
@@ -403,14 +460,26 @@ router.post('/v1/chat/completions', async (req, res) => {
       res.write(mk({}, 'stop'));
       res.write('data: [DONE]\n\n');
       res.end();
+      logEntry.status = 'success';
+      logEntry.duration = Date.now() - startTime;
     } else {
       const ld = await callLangdock(messages, lm);
       const text = extractText(ld);
-      if (ld.status >= 400) return res.status(ld.status).json({ error: { message: 'Langdock: ' + ld.body.slice(0, 500), type: 'upstream_error' } });
+      logEntry.duration = Date.now() - startTime;
+      if (ld.status >= 400) {
+        logEntry.status = 'error';
+        logEntry.error = 'Langdock: ' + ld.body.slice(0, 200);
+        return res.status(ld.status).json({ error: { message: 'Langdock: ' + ld.body.slice(0, 500), type: 'upstream_error' } });
+      }
+      logEntry.status = 'success';
+      logEntry.responsePreview = text.slice(0, 200);
       res.json(toOpenAIResponse(text, model));
     }
   } catch (e) {
     log('error:', e.message);
+    logEntry.status = 'error';
+    logEntry.error = e.message;
+    logEntry.duration = Date.now() - startTime;
     if (!res.headersSent) res.status(502).json({ error: { message: e.message, type: 'bridge_error' } });
     else res.end();
   }
@@ -420,6 +489,20 @@ router.post('/v1/chat/completions', async (req, res) => {
 router.post('/v1/messages', async (req, res) => {
   const { messages, model, system, stream } = req.body || {};
   if (!messages) return res.status(400).json({ error: { type: 'invalid_request_error', message: 'messages required' } });
+
+  const startTime = Date.now();
+  const logEntry = addCallLog({
+    id: uuid().slice(0, 8),
+    endpoint: '/v1/messages',
+    model: model || 'auto',
+    messageCount: messages.length,
+    stream: !!stream,
+    status: 'pending',
+    duration: 0,
+    responsePreview: '',
+    error: null,
+  });
+
   let msgs = (messages || []).map(m => {
     let c = m.content;
     if (Array.isArray(c)) c = c.filter(x => x.type === 'text').map(x => x.text).join('');
@@ -428,6 +511,8 @@ router.post('/v1/messages', async (req, res) => {
   if (system) msgs.unshift({ role: 'system', content: typeof system === 'string' ? system : JSON.stringify(system) });
   try {
     const lm = await resolveModel(model);
+    logEntry.model = lm.displayName || lm.providerModelId || model;
+    logEntry.modelId = lm.id;
     log(`/v1/messages model=${model} → ${lm.providerModelId} msgs=${msgs.length} stream=${stream}`);
     const msgId = 'msg_' + uuid().replace(/-/g, '');
 
@@ -449,14 +534,26 @@ router.post('/v1/messages', async (req, res) => {
       ev('message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 0 } });
       ev('message_stop', { type: 'message_stop' });
       res.end();
+      logEntry.status = 'success';
+      logEntry.duration = Date.now() - startTime;
     } else {
       const ld = await callLangdock(msgs, lm);
       const text = extractText(ld);
-      if (ld.status >= 400) return res.status(ld.status).json({ error: { message: 'Langdock: ' + ld.body.slice(0, 500), type: 'upstream_error' } });
+      logEntry.duration = Date.now() - startTime;
+      if (ld.status >= 400) {
+        logEntry.status = 'error';
+        logEntry.error = 'Langdock: ' + ld.body.slice(0, 200);
+        return res.status(ld.status).json({ error: { message: 'Langdock: ' + ld.body.slice(0, 500), type: 'upstream_error' } });
+      }
+      logEntry.status = 'success';
+      logEntry.responsePreview = text.slice(0, 200);
       res.json(toClaudeResponse(text, model));
     }
   } catch (e) {
     log('error:', e.message);
+    logEntry.status = 'error';
+    logEntry.error = e.message;
+    logEntry.duration = Date.now() - startTime;
     if (!res.headersSent) res.status(502).json({ error: { message: e.message, type: 'bridge_error' } });
     else res.end();
   }
@@ -473,8 +570,24 @@ router.post('/v1/responses', async (req, res) => {
     return { role: m.role || 'user', content: c };
   });
   if (!messages.length) return res.status(400).json({ error: { message: 'input required' } });
+
+  const startTime = Date.now();
+  const logEntry = addCallLog({
+    id: uuid().slice(0, 8),
+    endpoint: '/v1/responses',
+    model: model || 'auto',
+    messageCount: messages.length,
+    stream: !!stream,
+    status: 'pending',
+    duration: 0,
+    responsePreview: '',
+    error: null,
+  });
+
   try {
     const lm = await resolveModel(model);
+    logEntry.model = lm.displayName || lm.providerModelId || model;
+    logEntry.modelId = lm.id;
     log(`/v1/responses model=${model} → ${lm.providerModelId} msgs=${messages.length} stream=${stream}`);
 
     if (stream) {
@@ -494,9 +607,19 @@ router.post('/v1/responses', async (req, res) => {
       res.write(mk('response.output_text.done', { text: '' }));
       res.write(mk('response.completed', { response: { id: rid, object: 'response', model: model || 'auto', status: 'completed' } }));
       res.end();
+      logEntry.status = 'success';
+      logEntry.duration = Date.now() - startTime;
     } else {
       const ld = await callLangdock(messages, lm);
       const text = extractText(ld);
+      logEntry.duration = Date.now() - startTime;
+      if (ld.status >= 400) {
+        logEntry.status = 'error';
+        logEntry.error = 'Langdock: ' + ld.body.slice(0, 200);
+        return res.status(ld.status).json({ error: { message: 'Langdock: ' + ld.body.slice(0, 500), type: 'upstream_error' } });
+      }
+      logEntry.status = 'success';
+      logEntry.responsePreview = text.slice(0, 200);
       res.json({
         id: 'resp_' + uuid().replace(/-/g, ''),
         object: 'response',
@@ -508,6 +631,9 @@ router.post('/v1/responses', async (req, res) => {
     }
   } catch (e) {
     log('error:', e.message);
+    logEntry.status = 'error';
+    logEntry.error = e.message;
+    logEntry.duration = Date.now() - startTime;
     if (!res.headersSent) res.status(502).json({ error: { message: e.message } });
     else res.end();
   }
@@ -517,3 +643,5 @@ module.exports = router;
 module.exports.callLangdock = callLangdock;
 module.exports.extractText = extractText;
 module.exports.getModels = getModels;
+module.exports.getCallLogs = getCallLogs;
+module.exports.getCallLogStats = getCallLogStats;

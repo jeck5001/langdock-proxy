@@ -375,6 +375,24 @@ app.get('/api/system', async (req, res) => {
   });
 });
 
+// ---------- LLM 调用日志 ----------
+// 日志由 bridge.js 里的 addCallLog() 记录
+// 这里暴露 API 给 Web UI 查询
+const bridgeModule = require('./bridge');
+
+app.get('/api/bridge/logs', auth, (req, res) => {
+  const limit = parseInt(req.query.limit) || 100;
+  const offset = parseInt(req.query.offset) || 0;
+  res.json({
+    logs: bridgeModule.getCallLogs(limit, offset),
+    stats: bridgeModule.getCallLogStats(),
+  });
+});
+
+app.get('/api/bridge/logs/stats', auth, (req, res) => {
+  res.json(bridgeModule.getCallLogStats());
+});
+
 // ---------- 启动 ----------
 app.listen(PORT, () => {
   console.log(`\nLangdock Proxy Manager 已启动`);
