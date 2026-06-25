@@ -1,37 +1,25 @@
 services:
-  # LLM Bridge — 把 Langdock 账号转成 OpenAI/Claude/Codex 兼容 API
-  # 在 Claude Code / Codex / Cursor 里配置成 Base URL 即可使用
-  bridge:
+  # Langdock Proxy — 一个服务, 同时提供:
+  #   1. 反代管理 (Web UI + REST API, 端口 8080 的 / 和 /api/*)
+  #   2. LLM Bridge (OpenAI/Claude/Codex 兼容 API, 端口 8080 的 /v1/*)
+  # 客户端用同一个 MANAGER_TOKEN 当 Bearer token, 既能管理又能调 LLM
+  langdock:
     image: ghcr.io/jeck5001/langdock-proxy-manager:latest
-    container_name: langdock-bridge
-    restart: unless-stopped
-    ports:
-      - "8963:8963"
-    environment:
-      BRIDGE_PORT: "8963"
-      # 必填: 从 app.langdock.com 浏览器抓取 Cookie (F12 → Network → /api/engine → Cookie 头)
-      LANGDOCK_COOKIE: "${LANGDOCK_COOKIE}"
-      # 可选: 保护 API 的 token (不填则不校验; 客户端 Authorization: Bearer <token>)
-      BRIDGE_TOKEN: "${BRIDGE_TOKEN:-}"
-      DEBUG: "${DEBUG:-0}"
-    command: ["node", "bridge.js"]
-
-  # 反代管理平台 (可选, 默认不启动)
-  # 想用 Web UI 管多个反代容器时, 加 --profile manager 启动:
-  #   docker compose --profile manager up -d
-  manager:
-    image: ghcr.io/jeck5001/langdock-proxy-manager:latest
-    container_name: langdock-proxy-manager
-    profiles: ["manager"]
+    container_name: langdock-proxy
     restart: unless-stopped
     ports:
       - "8080:8080"
     environment:
       MANAGER_PORT: "8080"
+      # 访问 token: 既是管理 UI 的登录密码, 也是 LLM API 的 Bearer token
       MANAGER_TOKEN: "${MANAGER_TOKEN:-changeme}"
       DATA_DIR: "/data"
       PROXY_IMAGE: "ghcr.io/jeck5001/langdock-proxy:latest"
+      # Langdock Cookie (从浏览器抓, 用于 LLM Bridge 调用 app.langdock.com)
+      LANGDOCK_COOKIE: "${LANGDOCK_COOKIE:-}"
+      DEBUG: "${DEBUG:-0}"
     volumes:
+      # docker.sock: 管理反代容器需要; 不用反代管理功能也无所谓, 挂上不碍事
       - /var/run/docker.sock:/var/run/docker.sock
+      # 配置持久化
       - ./data:/data
-    command: ["node", "manager.js"]

@@ -197,6 +197,16 @@ app.use('/api', (req, res, next) => {
   auth(req, res, next);
 });
 
+// ---------- LLM Bridge (OpenAI/Claude/Codex 兼容 API) ----------
+// bridge.js 导出 Express router, 内部路径是 /v1/xxx
+// 复用 manager 的 token 认证: 客户端用同一个 Bearer token 既能调 /api/* 管理反代, 也能调 /v1/* 跑 LLM
+const bridgeRouter = require('./bridge');
+app.use('/', (req, res, next) => {
+  // 只对 /v1 路径走 bridge 认证, 其他放行 (静态 UI / /api 已有自己的认证)
+  if (!req.path.startsWith('/v1/')) return next();
+  auth(req, res, next);
+}, bridgeRouter);
+
 // ---------- API ----------
 
 // 登录
