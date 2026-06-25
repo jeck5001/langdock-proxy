@@ -1,21 +1,14 @@
-services:
-  # 反代引擎镜像 (manager 用来启动每个代理实例)
-  # 只需构建一次, manager 会用这个镜像创建代理容器
-  proxy-image:
-    image: langdock-proxy:latest
-    build:
-      context: .
-      dockerfile: Dockerfile
-    # 这个服务本身不运行, 只是为了构建镜像; 用 profiles 把它默认隐藏
-    profiles: ["build"]
-    command: ["echo", "image built"]
+# Langdock Proxy Manager
+# -----------------------
+# 在 NAS 上部署: 只需 docker compose up -d, 镜像从 ghcr.io 拉取
+#
+# 前置: 需要设置 MANAGER_TOKEN 环境变量 (或改下面的值)
+#   export MANAGER_TOKEN="your-strong-password"
+# 或直接编辑下面的 MANAGER_TOKEN 行
 
-  # 管理平台
+services:
   manager:
-    build:
-      context: .
-      dockerfile: Dockerfile.manager
-    image: langdock-proxy-manager:latest
+    image: ghcr.io/jeck5001/langdock-proxy-manager:latest
     container_name: langdock-proxy-manager
     restart: unless-stopped
     ports:
@@ -23,13 +16,21 @@ services:
     environment:
       MANAGER_PORT: "8080"
       # 访问 token — 务必改成你自己的强密码!
-      MANAGER_TOKEN: "changeme-please"
+      MANAGER_TOKEN: "${MANAGER_TOKEN:-changeme-please}"
       DATA_DIR: "/data"
-      # manager 用来创建反代容器的镜像名 (必须和上面 proxy-image 构建出的镜像名一致)
-      PROXY_IMAGE: "langdock-proxy:latest"
+      # manager 用这个镜像创建反代容器 (和下面 proxy 服务用的同一个镜像)
+      PROXY_IMAGE: "ghcr.io/jeck5001/langdock-proxy:latest"
     volumes:
       # 挂载 docker.sock, 让 manager 能控制宿主 Docker
       - /var/run/docker.sock:/var/run/docker.sock
-      # 配置持久化
+      # 配置持久化 (proxies.json)
       - ./data:/data
-      # 挂载本目录, 让 manager 能访问 proxy.js 等 (其实镜像已内置, 这里备用)
+
+  # 反代引擎镜像 (manager 用它创建每个代理实例)
+  # 这个服务本身不运行, 只是声明镜像来源, 方便预拉取:
+  #   docker compose --profile pull pull
+  # 真正的反代容器由 manager 通过 dockerode 动态创建
+  proxy-image:
+    image: ghcr.io/jeck5001/langdock-proxy:latest
+    profiles: ["pull"]
+    command: ["echo", "image pulled"]

@@ -30,24 +30,31 @@
 
 ## 快速开始
 
+镜像由 GitHub Actions 自动构建并推送到 [ghcr.io/jeck5001](https://github.com/jeck5001/langdock-proxy/pkgs).
+NAS 上无需构建, 直接拉取部署:
+
 ```bash
-# 1. 克隆
+# 1. 克隆配置 (只需要 compose 文件, 不需要源码)
 git clone https://github.com/jeck5001/langdock-proxy.git
 cd langdock-proxy
 
-# 2. 构建反代镜像 (manager 会用它创建代理容器)
-docker compose --profile build up --build
+# 2. 改 docker-compose.yml 里的 MANAGER_TOKEN 成你自己的强密码
+#    (必改! 默认是 changeme-please)
 
-# 3. 启动 manager
-docker compose up -d --build
+# 3. 预拉取反代镜像 (manager 创建代理时会用到)
+docker compose --profile pull pull
 
-# 4. 访问 Web UI
-#    http://<nas-ip>:8080
-#    首次 token 见 manager 日志, 或在 docker-compose.yml 里设 MANAGER_TOKEN
+# 4. 启动 manager
+docker compose up -d
+
+# 5. 看 token (如果没改 MANAGER_TOKEN 的话, 这里会显示随机生成的)
 docker compose logs manager | grep Token
+
+# 6. 打开 Web UI
+open http://<nas-ip>:8080
 ```
 
-在 UI 里点「新建代理」, 填名称/target/端口, 保存即可. manager 会自动创建并启动一个反代容器.
+在 UI 里点「新建代理」, 填名称/target/端口, 保存即可. manager 会自动拉取反代镜像并启动一个代理容器.
 
 ## 配置
 
