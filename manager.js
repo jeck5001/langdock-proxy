@@ -3,32 +3,7 @@
 /**
  * Langdock Proxy Manager
  * ----------------------
- * 多代理管理平台: 通过 Docker 编排多个反代实例, 提供 Web UI + REST API.
- *
- * 架构:
- *   - manager 自己也跑在容器里, 挂载 /var/run/docker.sock 控制宿主 Docker
- *   - 每个代理 = 一个反代容器 (基于 proxy.js 镜像)
- *   - 配置持久化到 /data/proxies.json
- *   - 日志通过 docker logs 拉取
- *
- * REST API (除 /api/auth 外都要 Bearer token):
- *   POST   /api/auth              { token } → 验证, 返回 session
- *   GET    /api/proxies            → 列出所有代理
- *   POST   /api/proxies            → 创建代理 { name, target, port, prefix, cookieDomain, cookiePath, rewriteBody }
- *   GET    /api/proxies/:id        → 单个代理详情
- *   PUT    /api/proxies/:id        → 更新配置 (会重建容器)
- *   DELETE /api/proxies/:id        → 删除代理 (停+删容器)
- *   POST   /api/proxies/:id/start  → 启动
- *   POST   /api/proxies/:id/stop   → 停止
- *   POST   /api/proxies/:id/restart→ 重启
- *   GET    /api/proxies/:id/logs?tail=200 → 获取日志
- *   GET    /api/proxies/:id/status → 容器状态
- *
- * 环境变量:
- *   MANAGER_PORT   监听端口 (默认 8080)
- *   MANAGER_TOKEN  访问 token (必填, 没有则随机生成并打印)
- *   DATA_DIR       配置存储目录 (默认 /data)
- *   PROXY_IMAGE    反代镜像名 (默认 langdock-proxy, 即同 repo 构建的镜像)
+ * 多代理管理平台: Web UI + REST API + Docker 编排
  */
 
 const express = require('express');
@@ -36,7 +11,6 @@ const Docker = require('dockerode');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { exec } = require('child_process');
 
 // ---------- 配置 ----------
 const PORT = process.env.MANAGER_PORT || 8080;
@@ -58,18 +32,14 @@ if (!TOKEN) {
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // ---------- Docker ----------
-// Docker 不可用时 docker=null, 容器操作返回友好错误, 但 API/UI 仍可用
 let docker = null;
 let dockerError = null;
 try {
   docker = new Docker({ socketPath: '/var/run/docker.sock' });
-  // 立即 ping 一次, 确认 socket 可达 (避免后续每个操作才发现)
-  // 用同步方式: 尝试 dockerode 的 listContainers
 } catch (e) {
   dockerError = e.message;
   console.warn('[manager] Docker 初始化失败:', e.message);
   console.warn('  容器操作将不可用, 但 Web UI / API / 配置管理仍可正常工作.');
-  console.warn('  若在容器内运行, 请挂载 /var/run/docker.sock');
 }
 
 // ---------- 配置存储 ----------
@@ -162,7 +132,6 @@ function getContainerLogs(id, tail = 200) {
   if (!docker) return Promise.resolve('[Docker 不可用, 无法获取日志]');
   return new Promise((resolve) => {
     const name = containerName(id);
-    // 用 docker logs 命令, 比 dockerode 流更简单
     exec(`docker logs --tail ${tail} ${name} 2>&1`, (err, stdout) => {
       if (err) {
         resolve('[无日志或容器不存在]');
@@ -175,10 +144,12 @@ function getContainerLogs(id, tail = 200) {
 
 // ---------- Express ----------
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
+
+// 静态文件 (Web UI)
 app.use(express.static(path.join(__dirname, 'public')));
 
-// 认证中间件
+// ---------- 认证中间件 ----------
 function auth(req, res, next) {
   const t = req.headers.authorization;
   if (t === 'Bearer ' + TOKEN || req.query.token === TOKEN) {
@@ -198,14 +169,15 @@ app.use('/api', (req, res, next) => {
 });
 
 // ---------- LLM Bridge (OpenAI/Claude/Codex 兼容 API) ----------
-// bridge.js 导出 Express router, 内部路径是 /v1/xxx
-// 复用 manager 的 token 认证: 客户端用同一个 Bearer token 既能调 /api/* 管理反代, 也能调 /v1/* 跑 LLM
-const bridgeRouter = require('./bridge');
+const bridgeModule = require('./bridge');
+
+// 挂载 bridge 路由 (需要认证)
 app.use('/', (req, res, next) => {
-  // 只对 /v1 路径走 bridge 认证, 其他放行 (静态 UI / /api 已有自己的认证)
-  if (!req.path.startsWith('/v1/')) return next();
-  auth(req, res, next);
-}, bridgeRouter);
+  if (req.path.startsWith('/v1/')) {
+    return auth(req, res, next);
+  }
+  next();
+}, bridgeModule);
 
 // ---------- API ----------
 
@@ -226,89 +198,121 @@ app.get('/api/auth/verify', auth, (req, res) => {
 
 // 列出所有代理
 app.get('/api/proxies', async (req, res) => {
-  const cfg = loadConfig();
-  const list = await Promise.all(cfg.proxies.map(async (p) => {
-    const status = await getContainerStatus(p.id);
-    return { ...p, status };
-  }));
-  res.json({ proxies: list });
+  try {
+    const cfg = loadConfig();
+    const list = await Promise.all(cfg.proxies.map(async (p) => {
+      const status = await getContainerStatus(p.id);
+      return { ...p, status };
+    }));
+    res.json({ proxies: list });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // 创建代理
 app.post('/api/proxies', async (req, res) => {
-  const { name, target, port, prefix, cookieDomain, cookiePath, rewriteBody, debug } = req.body || {};
-  if (!name || !target) {
-    return res.status(400).json({ error: 'name and target are required' });
-  }
-  const cfg = loadConfig();
-  const p = {
-    id: genId(),
-    name,
-    target,
-    port: port || 3000,
-    hostPort: port || 3000,
-    prefix: prefix || '',
-    cookieDomain: cookieDomain || '',
-    cookiePath: cookiePath || '/',
-    rewriteBody: rewriteBody !== false,
-    debug: !!debug,
-    createdAt: new Date().toISOString(),
-  };
-  cfg.proxies.push(p);
-  saveConfig(cfg);
   try {
-    await startProxyContainer(p);
-    res.json({ ok: true, proxy: p });
+    const { name, target, port, prefix, cookieDomain, cookiePath, rewriteBody, debug, autoRestart } = req.body;
+    if (!name || !target || !port) {
+      return res.status(400).json({ error: 'name, target, port 必填' });
+    }
+    const cfg = loadConfig();
+    if (cfg.proxies.find(p => p.name === name)) {
+      return res.status(409).json({ error: '同名代理已存在' });
+    }
+    const p = {
+      id: genId(),
+      name, target, port,
+      prefix: prefix || '',
+      cookieDomain: cookieDomain || '',
+      cookiePath: cookiePath || '/',
+      rewriteBody: rewriteBody !== false,
+      debug: !!debug,
+      autoRestart: autoRestart !== false,
+      createdAt: new Date().toISOString(),
+    };
+    cfg.proxies.push(p);
+    saveConfig(cfg);
+    // 创建并启动容器
+    try {
+      await startProxyContainer(p);
+      res.status(201).json({ proxy: { ...p, status: 'running' } });
+    } catch (e) {
+      res.status(201).json({ proxy: { ...p, status: 'start_failed' }, error: e.message });
+    }
   } catch (e) {
-    res.status(500).json({ error: 'start failed: ' + e.message, proxy: p });
+    res.status(500).json({ error: e.message });
   }
 });
 
-// 单个代理详情
+// 查看单个
 app.get('/api/proxies/:id', async (req, res) => {
-  const cfg = loadConfig();
-  const p = cfg.proxies.find(x => x.id === req.params.id);
-  if (!p) return res.status(404).json({ error: 'not found' });
-  const status = await getContainerStatus(p.id);
-  res.json({ ...p, status });
-});
-
-// 更新代理 (重建容器)
-app.put('/api/proxies/:id', async (req, res) => {
-  const cfg = loadConfig();
-  const idx = cfg.proxies.findIndex(x => x.id === req.params.id);
-  if (idx < 0) return res.status(404).json({ error: 'not found' });
-  const updates = req.body || {};
-  Object.assign(cfg.proxies[idx], updates, { updatedAt: new Date().toISOString() });
-  saveConfig(cfg);
-  await stopProxyContainer(cfg.proxies[idx].id);
   try {
-    await startProxyContainer(cfg.proxies[idx]);
-    res.json({ ok: true, proxy: cfg.proxies[idx] });
+    const cfg = loadConfig();
+    const p = cfg.proxies.find(x => x.id === req.params.id);
+    if (!p) return res.status(404).json({ error: '代理不存在' });
+    const status = await getContainerStatus(p.id);
+    res.json({ proxy: { ...p, status } });
   } catch (e) {
-    res.status(500).json({ error: 'restart failed: ' + e.message });
+    res.status(500).json({ error: e.message });
   }
 });
 
-// 删除代理
+// 更新 (重建容器)
+app.put('/api/proxies/:id', async (req, res) => {
+  try {
+    const cfg = loadConfig();
+    const p = cfg.proxies.find(x => x.id === req.params.id);
+    if (!p) return res.status(404).json({ error: '代理不存在' });
+    const { target, port, prefix, cookieDomain, cookiePath, rewriteBody, debug, autoRestart } = req.body;
+    Object.assign(p, {
+      target: target || p.target,
+      port: port || p.port,
+      prefix: prefix !== undefined ? prefix : p.prefix,
+      cookieDomain: cookieDomain !== undefined ? cookieDomain : p.cookieDomain,
+      cookiePath: cookiePath !== undefined ? cookiePath : p.cookiePath,
+      rewriteBody: rewriteBody !== false,
+      debug: debug !== undefined ? !!debug : p.debug,
+      autoRestart: autoRestart !== false,
+      updatedAt: new Date().toISOString(),
+    });
+    saveConfig(cfg);
+    // 重建容器
+    const wasRunning = (await getContainerStatus(p.id)) === 'running';
+    await stopProxyContainer(p.id);
+    if (wasRunning) {
+      await startProxyContainer(p);
+    }
+    res.json({ proxy: { ...p, status: wasRunning ? 'running' : 'not-created' } });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 删除
 app.delete('/api/proxies/:id', async (req, res) => {
-  const cfg = loadConfig();
-  const idx = cfg.proxies.findIndex(x => x.id === req.params.id);
-  if (idx < 0) return res.status(404).json({ error: 'not found' });
-  await stopProxyContainer(cfg.proxies[idx].id);
-  cfg.proxies.splice(idx, 1);
-  saveConfig(cfg);
-  res.json({ ok: true });
+  try {
+    const cfg = loadConfig();
+    const idx = cfg.proxies.findIndex(x => x.id === req.params.id);
+    if (idx === -1) return res.status(404).json({ error: '代理不存在' });
+    await stopProxyContainer(cfg.proxies[idx].id);
+    cfg.proxies.splice(idx, 1);
+    saveConfig(cfg);
+    res.json({ deleted: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // 启动
 app.post('/api/proxies/:id/start', async (req, res) => {
-  const cfg = loadConfig();
-  const p = cfg.proxies.find(x => x.id === req.params.id);
-  if (!p) return res.status(404).json({ error: 'not found' });
   try {
+    const cfg = loadConfig();
+    const p = cfg.proxies.find(x => x.id === req.params.id);
+    if (!p) return res.status(404).json({ error: '代理不存在' });
     await startProxyContainer(p);
-    res.json({ ok: true });
+    res.json({ status: 'running' });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -316,22 +320,26 @@ app.post('/api/proxies/:id/start', async (req, res) => {
 
 // 停止
 app.post('/api/proxies/:id/stop', async (req, res) => {
-  const cfg = loadConfig();
-  const p = cfg.proxies.find(x => x.id === req.params.id);
-  if (!p) return res.status(404).json({ error: 'not found' });
-  await stopProxyContainer(p.id);
-  res.json({ ok: true });
+  try {
+    const cfg = loadConfig();
+    const p = cfg.proxies.find(x => x.id === req.params.id);
+    if (!p) return res.status(404).json({ error: '代理不存在' });
+    await stopProxyContainer(p.id);
+    res.json({ status: 'stopped' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // 重启
 app.post('/api/proxies/:id/restart', async (req, res) => {
-  const cfg = loadConfig();
-  const p = cfg.proxies.find(x => x.id === req.params.id);
-  if (!p) return res.status(404).json({ error: 'not found' });
-  await stopProxyContainer(p.id);
   try {
+    const cfg = loadConfig();
+    const p = cfg.proxies.find(x => x.id === req.params.id);
+    if (!p) return res.status(404).json({ error: '代理不存在' });
+    await stopProxyContainer(p.id);
     await startProxyContainer(p);
-    res.json({ ok: true });
+    res.json({ status: 'running' });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -339,21 +347,29 @@ app.post('/api/proxies/:id/restart', async (req, res) => {
 
 // 日志
 app.get('/api/proxies/:id/logs', async (req, res) => {
-  const cfg = loadConfig();
-  const p = cfg.proxies.find(x => x.id === req.params.id);
-  if (!p) return res.status(404).json({ error: 'not found' });
-  const tail = parseInt(req.query.tail, 10) || 200;
-  const logs = await getContainerLogs(p.id, tail);
-  res.json({ logs });
+  try {
+    const cfg = loadConfig();
+    const p = cfg.proxies.find(x => x.id === req.params.id);
+    if (!p) return res.status(404).json({ error: '代理不存在' });
+    const tail = parseInt(req.query.tail, 10) || 200;
+    const logs = await getContainerLogs(p.id, tail);
+    res.json({ logs });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // 状态
 app.get('/api/proxies/:id/status', async (req, res) => {
-  const cfg = loadConfig();
-  const p = cfg.proxies.find(x => x.id === req.params.id);
-  if (!p) return res.status(404).json({ error: 'not found' });
-  const status = await getContainerStatus(p.id);
-  res.json(status);
+  try {
+    const cfg = loadConfig();
+    const p = cfg.proxies.find(x => x.id === req.params.id);
+    if (!p) return res.status(404).json({ error: '代理不存在' });
+    const status = await getContainerStatus(p.id);
+    res.json(status);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // 系统信息
@@ -375,11 +391,11 @@ app.get('/api/system', async (req, res) => {
   });
 });
 
-// ---------- LLM 调用日志 ----------
-// 日志由 bridge.js 里的 addCallLog() 记录
-// 这里暴露 API 给 Web UI 查询
-const bridgeModule = require('./bridge');
+// ============================================================
+// Bridge API 端点 (调用日志、统计、健康检查等)
+// ============================================================
 
+// 调用日志
 app.get('/api/bridge/logs', auth, (req, res) => {
   const limit = parseInt(req.query.limit) || 100;
   const offset = parseInt(req.query.offset) || 0;
@@ -393,6 +409,95 @@ app.get('/api/bridge/logs/stats', auth, (req, res) => {
   res.json(bridgeModule.getCallLogStats());
 });
 
+// 模型使用统计
+app.get('/api/bridge/stats/models', auth, (req, res) => {
+  res.json({ models: bridgeModule.getModelStats() });
+});
+
+// 对话历史
+app.get('/api/bridge/conversations', auth, (req, res) => {
+  const limit = parseInt(req.query.limit) || 50;
+  const offset = parseInt(req.query.offset) || 0;
+  const search = req.query.search || '';
+  res.json(bridgeModule.getConversations(limit, offset, search));
+});
+
+app.get('/api/bridge/conversations/:id', auth, (req, res) => {
+  const conv = bridgeModule.getConversation(req.params.id);
+  if (!conv) return res.status(404).json({ error: '对话不存在' });
+  res.json(conv);
+});
+
+app.delete('/api/bridge/conversations/:id', auth, (req, res) => {
+  const deleted = bridgeModule.deleteConversation(req.params.id);
+  if (!deleted) return res.status(404).json({ error: '对话不存在' });
+  res.json({ deleted: true });
+});
+
+// Prompt 模板
+app.get('/api/bridge/templates', auth, (req, res) => {
+  res.json({ templates: bridgeModule.getTemplates() });
+});
+
+app.post('/api/bridge/templates', auth, (req, res) => {
+  const { name, prompt, category } = req.body || {};
+  if (!name || !prompt) return res.status(400).json({ error: 'name and prompt required' });
+  const template = bridgeModule.addTemplate({ name, prompt, category });
+  res.json({ template });
+});
+
+app.delete('/api/bridge/templates/:id', auth, (req, res) => {
+  const deleted = bridgeModule.deleteTemplate(req.params.id);
+  if (!deleted) return res.status(404).json({ error: '模板不存在或不可删除' });
+  res.json({ deleted: true });
+});
+
+// 健康检查 (不需要认证)
+app.get('/api/bridge/health', async (req, res) => {
+  try {
+    const health = await bridgeModule.healthCheck();
+    res.json(health);
+  } catch (e) {
+    res.status(500).json({ status: 'error', error: e.message });
+  }
+});
+
+// 配置管理
+app.get('/api/bridge/config', auth, (req, res) => {
+  const config = bridgeModule.getConfig();
+  // 不返回完整的 cookie, 只返回是否已配置
+  res.json({
+    langdockBase: config.langdockBase,
+    langdockCookie: config.langdockCookie ? '已配置' : '未配置',
+    langdockCookieLength: config.langdockCookie ? config.langdockCookie.length : 0,
+    debug: config.debug,
+    rateLimit: config.rateLimit,
+    maxRetries: config.maxRetries,
+    webhookUrl: config.webhookUrl ? '已配置' : '未配置',
+    multiAccountCount: config.multiCookies.length,
+  });
+});
+
+app.put('/api/bridge/config', auth, (req, res) => {
+  const newConfig = req.body || {};
+  // 验证
+  if (newConfig.rateLimit !== undefined && (newConfig.rateLimit < 0 || newConfig.rateLimit > 10000)) {
+    return res.status(400).json({ error: 'rateLimit 必须在 0-10000 之间' });
+  }
+  if (newConfig.maxRetries !== undefined && (newConfig.maxRetries < 1 || newConfig.maxRetries > 10)) {
+    return res.status(400).json({ error: 'maxRetries 必须在 1-10 之间' });
+  }
+
+  const config = bridgeModule.updateConfig(newConfig);
+  res.json({ ok: true, config: {
+    langdockBase: config.langdockBase,
+    langdockCookie: config.langdockCookie ? '已配置' : '未配置',
+    debug: config.debug,
+    rateLimit: config.rateLimit,
+    maxRetries: config.maxRetries,
+  }});
+});
+
 // ---------- 启动 ----------
 app.listen(PORT, () => {
   console.log(`\nLangdock Proxy Manager 已启动`);
@@ -400,10 +505,11 @@ app.listen(PORT, () => {
   console.log(`  Web UI: http://0.0.0.0:${PORT}/`);
   console.log(`  Token: ${TOKEN}`);
   console.log(`  配置:  ${CONFIG_FILE}`);
+  console.log(`  Docker: ${docker ? '已连接' : '不可用'}`);
   console.log('');
 });
 
-// 启动时确保所有已配置的代理容器在运行 (重启 manager 后自愈)
+// 启动时确保所有已配置的代理容器在运行
 async function reconcile() {
   if (!docker) {
     console.log('[reconcile] Docker 不可用, 跳过自愈');

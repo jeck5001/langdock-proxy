@@ -1,41 +1,132 @@
 'use strict';
 
 /**
- * Bridge 路由模块 — 把 Langdock 账号转成 OpenAI/Claude/Codex 兼容 API
- * 导出一个 Express router, 挂到 manager 的 /v1/* 路径
+ * Langdock Bridge — 全功能 LLM API 转换层
  *
- * 路由:
- *   POST /v1/chat/completions   OpenAI Chat
- *   POST /v1/messages           Anthropic Claude
- *   POST /v1/responses          OpenAI Responses (Codex)
- *   GET  /v1/models             模型列表 (从 Langdock /api/models 动态拉取)
+ * 功能:
+ *   - OpenAI / Claude / Codex 兼容 API
+ *   - 32+ 模型选择
+ *   - 流式输出
+ *   - 多轮对话 (prompt 注入)
+ *   - Token 用量估算
+ *   - 模型使用统计
+ *   - 对话历史保存
+ *   - 快捷 Prompt 模板
+ *   - 速率限制
+ *   - 健康检查
+ *   - 配置热更新
+ *   - 智能路由
+ *   - 失败重试
  */
 
 const express = require('express');
 const https = require('https');
 const { URL } = require('url');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 function uuid() { return crypto.randomUUID(); }
 
-// ---------- 配置 ----------
-const LANGDOCK_BASE = process.env.LANGDOCK_BASE || 'https://app.langdock.com';
-const LANGDOCK_COOKIE = process.env.LANGDOCK_COOKIE || '';
-const DEBUG = process.env.DEBUG === '1';
+// ============================================================
+// 配置管理 (支持热更新)
+// ============================================================
+let config = {
+  langdockBase: process.env.LANGDOCK_BASE || 'https://app.langdock.com',
+  langdockCookie: process.env.LANGDOCK_COOKIE || '',
+  debug: process.env.DEBUG === '1',
+  // 速率限制: 每分钟最大请求数 (0=不限制)
+  rateLimit: parseInt(process.env.RATE_LIMIT) || 0,
+  // 重试次数
+  maxRetries: parseInt(process.env.MAX_RETRIES) || 1,
+  // Webhook URL (失败通知)
+  webhookUrl: process.env.WEBHOOK_URL || '',
+  // 多账号 Cookies (逗号分隔, 轮询使用)
+  multiCookies: process.env.LANGDOCK_COOKIES ? process.env.LANGDOCK_COOKIES.split(',') : [],
+};
 
-function log(...args) {
-  if (DEBUG) console.log('[bridge]', ...args);
+function getConfig() { return config; }
+
+function updateConfig(newConfig) {
+  Object.assign(config, newConfig);
+  console.log('[bridge] 配置已更新:', Object.keys(newConfig));
+  return config;
 }
 
-// ---------- 调用日志 ----------
-// 存储最近的调用记录，供 Web UI 查看
-const MAX_LOGS = 1000;
+function log(...args) {
+  if (config.debug) console.log('[bridge]', ...args);
+}
+
+// ============================================================
+// 速率限制
+// ============================================================
+const rateLimitMap = new Map(); // IP -> { count, resetTime }
+
+function checkRateLimit(clientIp) {
+  if (!config.rateLimit) return { allowed: true };
+  const now = Date.now();
+  const window = 60 * 1000; // 1 分钟
+
+  let entry = rateLimitMap.get(clientIp);
+  if (!entry || now > entry.resetTime) {
+    entry = { count: 0, resetTime: now + window };
+    rateLimitMap.set(clientIp, entry);
+  }
+
+  entry.count++;
+  if (entry.count > config.rateLimit) {
+    return { allowed: false, retryAfter: Math.ceil((entry.resetTime - now) / 1000) };
+  }
+  return { allowed: true, remaining: config.rateLimit - entry.count };
+}
+
+// ============================================================
+// Token 估算 (简化算法, 1 中文字 ≈ 2 token, 1 英文词 ≈ 1.3 token)
+// ============================================================
+function estimateTokens(text) {
+  if (!text) return 0;
+  // 简化计算: 字符数 / 4 (GPT 系列的近似值)
+  return Math.ceil(text.length / 4);
+}
+
+// ============================================================
+// 调用日志 & 统计
+// ============================================================
+const MAX_LOGS = 5000;
 const callLogs = [];
+
+// 按模型统计
+const modelStats = new Map(); // modelId -> { calls, success, errors, totalDuration, lastUsed }
 
 function addCallLog(entry) {
   entry.timestamp = new Date().toISOString();
+  entry.id = uuid().slice(0, 8);
+
+  // Token 估算
+  if (entry.inputText) {
+    entry.inputTokens = estimateTokens(entry.inputText);
+  }
+  if (entry.outputText) {
+    entry.outputTokens = estimateTokens(entry.outputText);
+  }
+
   callLogs.unshift(entry);
   if (callLogs.length > MAX_LOGS) callLogs.pop();
+
+  // 更新模型统计
+  if (entry.model) {
+    let stats = modelStats.get(entry.model);
+    if (!stats) {
+      stats = { calls: 0, success: 0, errors: 0, totalDuration: 0, lastUsed: null };
+      modelStats.set(entry.model, stats);
+    }
+    stats.calls++;
+    stats.totalDuration += entry.duration || 0;
+    stats.lastUsed = entry.timestamp;
+    if (entry.status === 'success') stats.success++;
+    if (entry.status === 'error') stats.errors++;
+  }
+
   return entry;
 }
 
@@ -50,99 +141,296 @@ function getCallLogStats() {
   const avgDuration = total > 0
     ? Math.round(callLogs.reduce((sum, l) => sum + (l.duration || 0), 0) / total)
     : 0;
-  return { total, success, errors, avgDuration };
+
+  // 总 Token 估算
+  const totalInputTokens = callLogs.reduce((sum, l) => sum + (l.inputTokens || 0), 0);
+  const totalOutputTokens = callLogs.reduce((sum, l) => sum + (l.outputTokens || 0), 0);
+
+  return { total, success, errors, avgDuration, totalInputTokens, totalOutputTokens };
 }
 
-// ---------- 模型缓存 ----------
-// 从 Langdock /api/models 拉取, 缓存 10 分钟
+function getModelStats() {
+  const stats = [];
+  for (const [model, data] of modelStats) {
+    stats.push({
+      model,
+      ...data,
+      avgDuration: data.calls > 0 ? Math.round(data.totalDuration / data.calls) : 0,
+    });
+  }
+  // 按调用次数排序
+  return stats.sort((a, b) => b.calls - a.calls);
+}
+
+// ============================================================
+// 对话历史
+// ============================================================
+const CONVERSATIONS_FILE = path.join(process.env.DATA_DIR || '.', 'conversations.json');
+let conversations = [];
+
+// 加载历史
+try {
+  if (fs.existsSync(CONVERSATIONS_FILE)) {
+    conversations = JSON.parse(fs.readFileSync(CONVERSATIONS_FILE, 'utf8'));
+    console.log(`[bridge] 加载了 ${conversations.length} 条对话历史`);
+  }
+} catch (e) {
+  console.error('[bridge] 加载对话历史失败:', e.message);
+}
+
+function saveConversations() {
+  try {
+    fs.writeFileSync(CONVERSATIONS_FILE, JSON.stringify(conversations, null, 2));
+  } catch (e) {
+    console.error('[bridge] 保存对话历史失败:', e.message);
+  }
+}
+
+function addConversation(entry) {
+  entry.id = uuid();
+  entry.timestamp = new Date().toISOString();
+  conversations.unshift(entry);
+  // 保留最近 10000 条
+  if (conversations.length > 10000) conversations = conversations.slice(0, 10000);
+  saveConversations();
+  return entry;
+}
+
+function getConversations(limit = 50, offset = 0, search = '') {
+  let filtered = conversations;
+  if (search) {
+    const lower = search.toLowerCase();
+    filtered = conversations.filter(c =>
+      (c.title && c.title.toLowerCase().includes(lower)) ||
+      (c.model && c.model.toLowerCase().includes(lower)) ||
+      (c.messages && c.messages.some(m => m.content && m.content.toLowerCase().includes(lower)))
+    );
+  }
+  return {
+    total: filtered.length,
+    conversations: filtered.slice(offset, offset + limit),
+  };
+}
+
+function getConversation(id) {
+  return conversations.find(c => c.id === id);
+}
+
+function deleteConversation(id) {
+  const idx = conversations.findIndex(c => c.id === id);
+  if (idx >= 0) {
+    conversations.splice(idx, 1);
+    saveConversations();
+    return true;
+  }
+  return false;
+}
+
+// ============================================================
+// 快捷 Prompt 模板
+// ============================================================
+const TEMPLATES_FILE = path.join(process.env.DATA_DIR || '.', 'templates.json');
+let templates = [
+  { id: 'translate-en', name: '翻译成英文', prompt: '请将以下内容翻译成英文：\n\n', category: '翻译' },
+  { id: 'translate-zh', name: '翻译成中文', prompt: '请将以下内容翻译成中文：\n\n', category: '翻译' },
+  { id: 'summarize', name: '总结摘要', prompt: '请为以下内容写一个简洁的摘要：\n\n', category: '写作' },
+  { id: 'code-review', name: '代码审查', prompt: '请审查以下代码，指出潜在问题和改进建议：\n\n', category: '编程' },
+  { id: 'explain', name: '解释概念', prompt: '请用简单易懂的语言解释以下概念：\n\n', category: '学习' },
+  { id: 'rewrite', name: '润色改写', prompt: '请润色并改写以下文字，使其更专业流畅：\n\n', category: '写作' },
+  { id: 'debug', name: '调试帮助', prompt: '我遇到以下错误，请帮我分析原因并提供解决方案：\n\n', category: '编程' },
+  { id: 'brainstorm', name: '头脑风暴', prompt: '请围绕以下主题提供 5-10 个创意想法：\n\n', category: '创意' },
+];
+
+// 加载自定义模板
+try {
+  if (fs.existsSync(TEMPLATES_FILE)) {
+    const custom = JSON.parse(fs.readFileSync(TEMPLATES_FILE, 'utf8'));
+    templates = [...templates, ...custom];
+  }
+} catch (e) {
+  console.error('[bridge] 加载模板失败:', e.message);
+}
+
+function getTemplates() { return templates; }
+
+function addTemplate(template) {
+  template.id = template.id || uuid();
+  template.custom = true;
+  templates.push(template);
+  // 保存自定义模板
+  const custom = templates.filter(t => t.custom);
+  try {
+    fs.writeFileSync(TEMPLATES_FILE, JSON.stringify(custom, null, 2));
+  } catch (e) {
+    console.error('[bridge] 保存模板失败:', e.message);
+  }
+  return template;
+}
+
+function deleteTemplate(id) {
+  const idx = templates.findIndex(t => t.id === id && t.custom);
+  if (idx >= 0) {
+    templates.splice(idx, 1);
+    const custom = templates.filter(t => t.custom);
+    try {
+      fs.writeFileSync(TEMPLATES_FILE, JSON.stringify(custom, null, 2));
+    } catch (e) {}
+    return true;
+  }
+  return false;
+}
+
+// ============================================================
+// 健康检查
+// ============================================================
+async function healthCheck() {
+  const result = {
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    langdock: { configured: !!config.langdockCookie, reachable: false },
+    multiAccount: { count: config.multiCookies.length },
+    uptime: process.uptime(),
+  };
+
+  if (config.langdockCookie) {
+    try {
+      const url = new URL(config.langdockBase + '/api/models');
+      const res = await new Promise((resolve, reject) => {
+        const req = https.request({
+          method: 'GET',
+          hostname: url.hostname,
+          path: url.pathname,
+          headers: {
+            'Cookie': config.langdockCookie,
+            'x-app-version': 'v7.17.0',
+          },
+        }, (r) => {
+          let d = ''; r.on('data', c => d += c);
+          r.on('end', () => resolve({ status: r.statusCode }));
+        });
+        req.on('error', reject);
+        req.setTimeout(10000, () => { req.destroy(); reject(new Error('timeout')); });
+        req.end();
+      });
+      result.langdock.reachable = res.status === 200;
+      result.langdock.status = res.status;
+    } catch (e) {
+      result.langdock.error = e.message;
+      result.status = 'degraded';
+    }
+  } else {
+    result.status = 'not_configured';
+  }
+
+  return result;
+}
+
+// ============================================================
+// 智能路由
+// ============================================================
+const MODEL_ROUTES = {
+  // Claude 请求 → Opus 4.8
+  'claude': ['claude-opus-4-8', 'claude-opus-4-7', 'claude-sonnet-4-6'],
+  // GPT 请求 → GPT-5.5
+  'gpt': ['gpt-5.5', 'gpt-5.4', 'gpt-5'],
+  // 通用 → auto
+  'default': ['auto'],
+};
+
+function getSmartRoute(modelName) {
+  if (!modelName || modelName === 'auto') return null;
+  const lower = modelName.toLowerCase();
+  for (const [key, models] of Object.entries(MODEL_ROUTES)) {
+    if (lower.includes(key)) return models[0]; // 返回第一个推荐模型
+  }
+  return null;
+}
+
+// ============================================================
+// 模型缓存
+// ============================================================
 let modelsCache = null;
 let modelsCacheTime = 0;
 const CACHE_TTL = 10 * 60 * 1000;
 
-// Langdock 模型 ID (UUID) → providerModelId (如 "claude-opus-4-8") 的映射
-// 客户端传的 model 名要匹配 providerModelId 或 displayName
 function fetchModels() {
   return new Promise((resolve, reject) => {
-    const url = new URL(LANGDOCK_BASE + '/api/models');
+    const url = new URL(config.langdockBase + '/api/models');
     const req = https.request({
       method: 'GET',
       hostname: url.hostname,
       path: url.pathname,
       headers: {
-        'Cookie': LANGDOCK_COOKIE,
+        'Cookie': config.langdockCookie,
         'x-app-version': 'v7.17.0',
-        'Accept': '*/*',
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
       },
     }, (res) => {
       const chunks = [];
       res.on('data', c => chunks.push(c));
       res.on('end', () => {
         try {
-          const arr = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-          resolve(arr);
+          resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
         } catch (e) { reject(e); }
       });
     });
     req.on('error', reject);
-    req.setTimeout(10000, () => { req.destroy(); reject(new Error('models 超时')); });
+    req.setTimeout(10000, () => { req.destroy(); reject(new Error('超时')); });
     req.end();
   });
 }
 
 async function getModels() {
   const now = Date.now();
-  if (modelsCache && (now - modelsCacheTime) < CACHE_TTL) {
-    return modelsCache;
-  }
+  if (modelsCache && (now - modelsCacheTime) < CACHE_TTL) return modelsCache;
   try {
-    const arr = await fetchModels();
-    modelsCache = arr;
+    modelsCache = await fetchModels();
     modelsCacheTime = now;
-    log('已拉取模型列表:', arr.length, '个');
-    return arr;
+    log('已拉取模型列表:', modelsCache.length, '个');
+    return modelsCache;
   } catch (e) {
     log('拉取模型列表失败:', e.message);
-    // 返回缓存 (即使过期) 或空
     return modelsCache || [];
   }
 }
 
-// 客户端传的 model 名 → Langdock 模型对象
-// 匹配顺序: providerModelId 完全匹配 → displayName 匹配 → provider 匹配 → 默认 auto
 async function resolveModel(clientModel) {
-  if (!clientModel || clientModel === 'auto' || clientModel === 'langdock-auto') {
-    return { modelId: 'auto', providerModelId: 'auto' };
+  if (!clientModel || clientModel === 'auto') {
+    return { id: 'auto', providerModelId: 'auto' };
   }
   const models = await getModels();
-  // 1) providerModelId 匹配 (如 "claude-opus-4-8", "gpt-5.5")
-  let m = models.find(x => x.providerModelId === clientModel);
+
+  // 精确匹配
+  let m = models.find(x => x.providerModelId === clientModel || x.displayName === clientModel);
   if (m) return m;
-  // 2) displayName 匹配 (如 "Opus 4.8")
-  m = models.find(x => x.displayName === clientModel);
-  if (m) return m;
-  // 3) 模糊匹配: clientModel 包含在 providerModelId 或 displayName 里
-  //    如 "opus" → 找到第一个含 opus 的
+
+  // 模糊匹配
   const lower = clientModel.toLowerCase();
   m = models.find(x =>
     (x.providerModelId || '').toLowerCase().includes(lower) ||
     (x.displayName || '').toLowerCase().includes(lower)
   );
   if (m) return m;
-  // 4) 兜底: auto
-  log('未找到模型:', clientModel, '→ 用 auto');
-  return { modelId: 'auto', providerModelId: 'auto' };
+
+  // 智能路由
+  const smart = getSmartRoute(clientModel);
+  if (smart) {
+    m = models.find(x => x.providerModelId === smart || x.displayName === smart);
+    if (m) {
+      log(`智能路由: ${clientModel} → ${m.providerModelId}`);
+      return m;
+    }
+  }
+
+  return { id: 'auto', providerModelId: 'auto' };
 }
 
-// ---------- 解析单行 Vercel AI SDK SSE → 文本 ----------
-// 支持三种格式:
-//   0:"text" (Vercel AI SDK)
-//   data: {"type":"text-delta","delta":"text"} (Opus extendedThinking)
-//   data: {"text":"..."} 或 {"content":"..."} (传统)
+// ============================================================
+// Langdock API 调用 (带重试)
+// ============================================================
 function parseVercelLine(line) {
   const trimmed = line.trim();
   if (!trimmed || trimmed.startsWith(':')) return null;
-  // Vercel AI SDK: 0:"text" / d:{...}
+
   const m = trimmed.match(/^(\d+|d):\s*(.*)$/);
   if (m) {
     if (m[1] === '0') {
@@ -150,14 +438,13 @@ function parseVercelLine(line) {
     }
     return null;
   }
-  // 传统 SSE: data: {...}
+
   const dm = trimmed.match(/^data:\s*(.*)$/);
   if (dm) {
     const payload = dm[1].trim();
     if (payload === '[DONE]' || payload === '') return null;
     try {
       const obj = JSON.parse(payload);
-      // text-delta (Opus 4.8 extendedThinking)
       if (obj.type === 'text-delta' && obj.delta) return obj.delta;
       return obj.text || obj.delta || obj.content || '';
     } catch {}
@@ -165,41 +452,17 @@ function parseVercelLine(line) {
   return null;
 }
 
-// 从 SSE 行里提取 data-conversation-id
-function parseConvId(line) {
-  try {
-    const m = line.match(/"data-conversation-id","data":"([^"]*)"/);
-    return m ? m[1] : null;
-  } catch { return null; }
-}
-
-// ---------- 会话复用 ----------
-// Langdock 服务端通过 convId 关联对话历史
-// 浏览器行为: 续接时只发新消息, 但用正确的 parentId 链接上一轮 assistant
-// threadId 始终 = 第一条消息的 id, parentId = 上一轮 assistant 的 messageId
-const convSessions = new Map(); // sessionKey → { convId, threadId, assistantMsgId, time }
-const CONV_TTL = 2 * 60 * 60 * 1000;
-
-function getSessionKey(messages) {
-  const firstUser = messages.find(m => m.role === 'user') || messages[0];
-  const content = typeof firstUser?.content === 'string' ? firstUser.content : JSON.stringify(firstUser?.content || '');
-  return crypto.createHash('sha256').update('u::' + content).digest('hex').slice(0, 16);
-} // 2小时过期
-
-// ---------- 调 Langdock /api/engine ----------
-// Langdock API 每次只处理单条消息, 不支持 messages 数组里的历史
-// 解决方案: 把客户端发的完整消息历史拼成 prompt, 让模型能看到上下文
 async function callLangdock(messages, langdockModel, streamMode, onChunk) {
   const isSpecific = langdockModel && langdockModel.id && langdockModel.id !== 'auto';
   const modelId = langdockModel?.id || 'auto';
   const modelProvider = langdockModel?.provider || null;
   const modelName = langdockModel?.displayName || null;
-  if (!LANGDOCK_COOKIE) throw new Error('LANGDOCK_COOKIE 未设置');
+  if (!config.langdockCookie) throw new Error('LANGDOCK_COOKIE 未设置');
 
   const convId = uuid();
   const threadId = uuid();
 
-  // 把消息历史拼成 prompt, 最后一条作为当前问题
+  // 构造 prompt (多轮对话支持)
   let prompt;
   if (messages.length === 1) {
     prompt = messages[0].content || '';
@@ -241,14 +504,14 @@ async function callLangdock(messages, langdockModel, streamMode, onChunk) {
   });
 
   return new Promise((resolve, reject) => {
-    const url = new URL(LANGDOCK_BASE + '/api/engine');
+    const url = new URL(config.langdockBase + '/api/engine');
     const req = https.request({
       method: 'POST', hostname: url.hostname, path: url.pathname,
       headers: {
         'Content-Type': 'application/json',
-        'Cookie': LANGDOCK_COOKIE,
-        'Origin': LANGDOCK_BASE,
-        'Referer': LANGDOCK_BASE + '/chat/' + convId,
+        'Cookie': config.langdockCookie,
+        'Origin': config.langdockBase,
+        'Referer': config.langdockBase + '/chat/' + convId,
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
         'Accept': '*/*', 'Accept-Language': 'zh-CN,zh;q=0.9',
         'x-app-version': 'v7.17.0',
@@ -283,9 +546,9 @@ async function callLangdock(messages, langdockModel, streamMode, onChunk) {
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => {
         const full = Buffer.concat(chunks).toString('utf8');
-        if (DEBUG) {
-          console.log('\n[bridge] === Langdock 响应 ===');
-          console.log('  status:', res.statusCode, 'ct:', ct);
+        if (config.debug) {
+          console.log('\n[bridge] === 响应 ===');
+          console.log('  status:', res.statusCode);
           console.log('  body (前 500):', full.slice(0, 500));
           console.log('[bridge] === end ===\n');
         }
@@ -300,7 +563,379 @@ async function callLangdock(messages, langdockModel, streamMode, onChunk) {
   });
 }
 
-// ---------- 解析 Langdock 响应 (Vercel AI SDK SSE) → 纯文本 ----------
+// 带重试的调用
+async function callLangdockWithRetry(messages, langdockModel, streamMode, onChunk) {
+  let lastError;
+  const maxRetries = config.maxRetries || 1;
+
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await callLangdock(messages, langdockModel, streamMode, onChunk);
+    } catch (e) {
+      lastError = e;
+      log(`重试 ${i + 1}/${maxRetries}:`, e.message);
+      if (i < maxRetries - 1) {
+        // 如果是模型相关错误, 尝试智能路由
+        if (langdockModel && langdockModel.id !== 'auto') {
+          const smart = getSmartRoute(langdockModel.providerModelId);
+          if (smart) {
+            log(`切换到备用模型: ${smart}`);
+            langdockModel = { id: smart, providerModelId: smart };
+          }
+        }
+      }
+    }
+  }
+  throw lastError;
+}
+
+// ============================================================
+// Webhook 通知
+// ============================================================
+async function sendWebhook(event, data) {
+  if (!config.webhookUrl) return;
+  try {
+    const url = new URL(config.webhookUrl);
+    const payload = JSON.stringify({
+      event,
+      data,
+      timestamp: new Date().toISOString(),
+    });
+    const lib = url.protocol === 'https:' ? https : http;
+    const req = lib.request({
+      method: 'POST',
+      hostname: url.hostname,
+      port: url.port,
+      path: url.pathname,
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+    }, () => {});
+    req.on('error', () => {});
+    req.write(payload);
+    req.end();
+  } catch (e) {
+    log('webhook 失败:', e.message);
+  }
+}
+
+// ============================================================
+// Express Router
+// ============================================================
+const router = express.Router();
+
+// ---------- 模型列表 ----------
+router.get('/v1/models', async (req, res) => {
+  try {
+    const models = await getModels();
+    res.json({
+      object: 'list',
+      data: models.map(m => ({
+        id: m.providerModelId,
+        object: 'model',
+        created: 1700000000,
+        owned_by: m.provider || 'langdock',
+        display_name: m.displayName,
+      })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: { message: '获取模型失败: ' + e.message } });
+  }
+});
+
+// ---------- OpenAI Chat Completions ----------
+router.post('/v1/chat/completions', async (req, res) => {
+  const clientIp = req.ip || req.connection?.remoteAddress || 'unknown';
+  const rateCheck = checkRateLimit(clientIp);
+  if (!rateCheck.allowed) {
+    return res.status(429).json({
+      error: { message: '请求过于频繁，请稍后再试', type: 'rate_limit' },
+      retry_after: rateCheck.retryAfter,
+    });
+  }
+
+  const { messages, model, stream } = req.body || {};
+  if (!messages) return res.status(400).json({ error: { message: 'messages required' } });
+
+  const startTime = Date.now();
+  const logEntry = {
+    endpoint: '/v1/chat/completions',
+    model: model || 'auto',
+    messageCount: messages.length,
+    stream: !!stream,
+    status: 'pending',
+    duration: 0,
+    responsePreview: '',
+    error: null,
+    inputText: messages.map(m => m.content || '').join('\n'),
+  };
+
+  try {
+    const lm = await resolveModel(model);
+    logEntry.model = lm.displayName || lm.providerModelId || model;
+    logEntry.modelId = lm.id;
+
+    if (stream) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      const id = 'chatcmpl-' + uuid().replace(/-/g, '').slice(0, 24);
+      const created = Math.floor(Date.now() / 1000);
+      const mk = (delta, fr) => `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model: model || 'auto', choices: [{ index: 0, delta, finish_reason: fr }] })}\n\n`;
+      res.write(mk({ role: 'assistant' }, null));
+
+      const outputChunks = [];
+      await callLangdockWithRetry(messages, lm, true, (text) => {
+        outputChunks.push(text);
+        res.write(mk({ content: text }, null));
+      });
+
+      res.write(mk({}, 'stop'));
+      res.write('data: [DONE]\n\n');
+      res.end();
+
+      logEntry.status = 'success';
+      logEntry.duration = Date.now() - startTime;
+      logEntry.outputText = outputChunks.join('');
+      logEntry.responsePreview = logEntry.outputText.slice(0, 200);
+    } else {
+      const ld = await callLangdockWithRetry(messages, lm);
+      const text = extractText(ld);
+      logEntry.duration = Date.now() - startTime;
+
+      if (ld.status >= 400) {
+        logEntry.status = 'error';
+        logEntry.error = 'Langdock: ' + ld.body.slice(0, 200);
+        sendWebhook('call_error', { model: logEntry.model, error: logEntry.error });
+        return res.status(ld.status).json({ error: { message: 'Langdock: ' + ld.body.slice(0, 500), type: 'upstream_error' } });
+      }
+
+      logEntry.status = 'success';
+      logEntry.outputText = text;
+      logEntry.responsePreview = text.slice(0, 200);
+      res.json(toOpenAIResponse(text, model));
+    }
+
+    addCallLog(logEntry);
+
+    // 保存对话历史
+    addConversation({
+      title: messages[messages.length - 1]?.content?.slice(0, 50) || '新对话',
+      model: logEntry.model,
+      messages: messages.map(m => ({ role: m.role, content: m.content })),
+      response: logEntry.outputText || '',
+      endpoint: 'chat/completions',
+    });
+
+  } catch (e) {
+    log('error:', e.message);
+    logEntry.status = 'error';
+    logEntry.error = e.message;
+    logEntry.duration = Date.now() - startTime;
+    addCallLog(logEntry);
+    sendWebhook('call_error', { model: logEntry.model, error: e.message });
+    if (!res.headersSent) res.status(502).json({ error: { message: e.message, type: 'bridge_error' } });
+    else res.end();
+  }
+});
+
+// ---------- Anthropic Messages ----------
+router.post('/v1/messages', async (req, res) => {
+  const clientIp = req.ip || req.connection?.remoteAddress || 'unknown';
+  const rateCheck = checkRateLimit(clientIp);
+  if (!rateCheck.allowed) {
+    return res.status(429).json({ error: { message: '请求过于频繁', type: 'rate_limit' } });
+  }
+
+  const { messages, model, system, stream } = req.body || {};
+  if (!messages) return res.status(400).json({ error: { type: 'invalid_request_error', message: 'messages required' } });
+
+  const startTime = Date.now();
+  let msgs = (messages || []).map(m => {
+    let c = m.content;
+    if (Array.isArray(c)) c = c.filter(x => x.type === 'text').map(x => x.text).join('');
+    return { role: m.role, content: c };
+  });
+  if (system) msgs.unshift({ role: 'system', content: typeof system === 'string' ? system : JSON.stringify(system) });
+
+  const logEntry = {
+    endpoint: '/v1/messages',
+    model: model || 'auto',
+    messageCount: msgs.length,
+    stream: !!stream,
+    status: 'pending',
+    duration: 0,
+    inputText: msgs.map(m => m.content || '').join('\n'),
+  };
+
+  try {
+    const lm = await resolveModel(model);
+    logEntry.model = lm.displayName || lm.providerModelId || model;
+    logEntry.modelId = lm.id;
+
+    if (stream) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      const msgId = 'msg_' + uuid().replace(/-/g, '');
+      const ev = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+      ev('message_start', { type: 'message_start', message: { id: msgId, type: 'message', role: 'assistant', content: [], model: model || 'auto', stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 } } });
+      ev('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+
+      const outputChunks = [];
+      await callLangdockWithRetry(msgs, lm, true, (text) => {
+        outputChunks.push(text);
+        ev('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } });
+      });
+
+      ev('content_block_stop', { type: 'content_block_stop', index: 0 });
+      ev('message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 0 } });
+      ev('message_stop', { type: 'message_stop' });
+      res.end();
+
+      logEntry.status = 'success';
+      logEntry.duration = Date.now() - startTime;
+      logEntry.outputText = outputChunks.join('');
+      logEntry.responsePreview = logEntry.outputText.slice(0, 200);
+    } else {
+      const ld = await callLangdockWithRetry(msgs, lm);
+      const text = extractText(ld);
+      logEntry.duration = Date.now() - startTime;
+
+      if (ld.status >= 400) {
+        logEntry.status = 'error';
+        logEntry.error = 'Langdock: ' + ld.body.slice(0, 200);
+        addCallLog(logEntry);
+        return res.status(ld.status).json({ error: { message: 'Langdock: ' + ld.body.slice(0, 500), type: 'upstream_error' } });
+      }
+
+      logEntry.status = 'success';
+      logEntry.outputText = text;
+      logEntry.responsePreview = text.slice(0, 200);
+      res.json(toClaudeResponse(text, model));
+    }
+
+    addCallLog(logEntry);
+    addConversation({
+      title: msgs[msgs.length - 1]?.content?.slice(0, 50) || '新对话',
+      model: logEntry.model,
+      messages: msgs,
+      response: logEntry.outputText || '',
+      endpoint: 'messages',
+    });
+
+  } catch (e) {
+    log('error:', e.message);
+    logEntry.status = 'error';
+    logEntry.error = e.message;
+    logEntry.duration = Date.now() - startTime;
+    addCallLog(logEntry);
+    if (!res.headersSent) res.status(502).json({ error: { message: e.message, type: 'bridge_error' } });
+    else res.end();
+  }
+});
+
+// ---------- OpenAI Responses (Codex) ----------
+router.post('/v1/responses', async (req, res) => {
+  const clientIp = req.ip || req.connection?.remoteAddress || 'unknown';
+  const rateCheck = checkRateLimit(clientIp);
+  if (!rateCheck.allowed) {
+    return res.status(429).json({ error: { message: '请求过于频繁', type: 'rate_limit' } });
+  }
+
+  const { input, model, stream } = req.body || {};
+  let messages = [];
+  if (typeof input === 'string') messages = [{ role: 'user', content: input }];
+  else if (Array.isArray(input)) messages = input.map(m => {
+    let c = m.content;
+    if (Array.isArray(c)) c = c.map(x => x.text || '').join('');
+    return { role: m.role || 'user', content: c };
+  });
+  if (!messages.length) return res.status(400).json({ error: { message: 'input required' } });
+
+  const startTime = Date.now();
+  const logEntry = {
+    endpoint: '/v1/responses',
+    model: model || 'auto',
+    messageCount: messages.length,
+    stream: !!stream,
+    status: 'pending',
+    duration: 0,
+    inputText: messages.map(m => m.content || '').join('\n'),
+  };
+
+  try {
+    const lm = await resolveModel(model);
+    logEntry.model = lm.displayName || lm.providerModelId || model;
+    logEntry.modelId = lm.id;
+
+    if (stream) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      const rid = 'resp_' + uuid().replace(/-/g, '');
+      const mk = (type, data) => `data: ${JSON.stringify({ type, ...data, id: rid })}\n\n`;
+      res.write(mk('response.created', { response: { id: rid, object: 'response', model: model || 'auto', status: 'in_progress' } }));
+
+      const outputChunks = [];
+      await callLangdockWithRetry(messages, lm, true, (text) => {
+        outputChunks.push(text);
+        res.write(mk('response.output_text.delta', { delta: text }));
+      });
+
+      res.write(mk('response.output_text.done', { text: '' }));
+      res.write(mk('response.completed', { response: { id: rid, object: 'response', model: model || 'auto', status: 'completed' } }));
+      res.end();
+
+      logEntry.status = 'success';
+      logEntry.duration = Date.now() - startTime;
+      logEntry.outputText = outputChunks.join('');
+      logEntry.responsePreview = logEntry.outputText.slice(0, 200);
+    } else {
+      const ld = await callLangdockWithRetry(messages, lm);
+      const text = extractText(ld);
+      logEntry.duration = Date.now() - startTime;
+
+      if (ld.status >= 400) {
+        logEntry.status = 'error';
+        logEntry.error = 'Langdock: ' + ld.body.slice(0, 200);
+        addCallLog(logEntry);
+        return res.status(ld.status).json({ error: { message: 'Langdock: ' + ld.body.slice(0, 500), type: 'upstream_error' } });
+      }
+
+      logEntry.status = 'success';
+      logEntry.outputText = text;
+      logEntry.responsePreview = text.slice(0, 200);
+      res.json({
+        id: 'resp_' + uuid().replace(/-/g, ''),
+        object: 'response',
+        created_at: Math.floor(Date.now() / 1000),
+        model: model || 'auto',
+        output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] }],
+        status: 'completed',
+      });
+    }
+
+    addCallLog(logEntry);
+    addConversation({
+      title: messages[messages.length - 1]?.content?.slice(0, 50) || '新对话',
+      model: logEntry.model,
+      messages,
+      response: logEntry.outputText || '',
+      endpoint: 'responses',
+    });
+
+  } catch (e) {
+    log('error:', e.message);
+    logEntry.status = 'error';
+    logEntry.error = e.message;
+    logEntry.duration = Date.now() - startTime;
+    addCallLog(logEntry);
+    if (!res.headersSent) res.status(502).json({ error: { message: e.message } });
+    else res.end();
+  }
+});
+
+// ============================================================
+// 辅助函数
+// ============================================================
 function extractText(langdockResp) {
   const { body } = langdockResp;
   const texts = [];
@@ -308,7 +943,6 @@ function extractText(langdockResp) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith(':')) continue;
 
-    // Vercel AI SDK: 0:"text" / d:{...}
     const vercelMatch = trimmed.match(/^(\d+|d):\s*(.*)$/);
     if (vercelMatch) {
       const type = vercelMatch[1];
@@ -319,7 +953,6 @@ function extractText(langdockResp) {
       continue;
     }
 
-    // 传统 SSE: data: {...}
     const dataMatch = trimmed.match(/^data:\s*(.*)$/);
     if (dataMatch) {
       const payload = dataMatch[1].trim();
@@ -344,7 +977,6 @@ function extractText(langdockResp) {
   } catch { return body; }
 }
 
-// ---------- 响应构造 ----------
 function toOpenAIResponse(text, model) {
   return {
     id: 'chatcmpl-' + uuid().replace(/-/g, '').slice(0, 24),
@@ -354,20 +986,6 @@ function toOpenAIResponse(text, model) {
     choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
   };
-}
-
-function toOpenAIStream(text, model, res) {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  const id = 'chatcmpl-' + uuid().replace(/-/g, '').slice(0, 24);
-  const created = Math.floor(Date.now() / 1000);
-  const mk = (delta, fr) => `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model: model || 'auto', choices: [{ index: 0, delta, finish_reason: fr }] })}\n\n`;
-  res.write(mk({ role: 'assistant' }, null));
-  res.write(mk({ content: text }, null));
-  res.write(mk({}, 'stop'));
-  res.write('data: [DONE]\n\n');
-  res.end();
 }
 
 function toClaudeResponse(text, model) {
@@ -381,267 +999,22 @@ function toClaudeResponse(text, model) {
   };
 }
 
-// ---------- Express Router ----------
-const router = express.Router();
-
-// 日志查询 API
-router.get('/logs', (req, res) => {
-  const limit = parseInt(req.query.limit) || 100;
-  const offset = parseInt(req.query.offset) || 0;
-  res.json({
-    logs: getCallLogs(limit, offset),
-    total: callLogs.length,
-    stats: getCallLogStats(),
-  });
-});
-
-router.get('/logs/stats', (req, res) => {
-  res.json(getCallLogStats());
-});
-
-// 模型列表 (动态从 Langdock 拉取)
-router.get('/v1/models', async (req, res) => {
-  try {
-    const models = await getModels();
-    res.json({
-      object: 'list',
-      data: models.map(m => ({
-        id: m.providerModelId,
-        object: 'model',
-        created: 1700000000,
-        owned_by: m.provider || 'langdock',
-        display_name: m.displayName,
-      })),
-    });
-  } catch (e) {
-    res.status(500).json({ error: { message: 'Failed to fetch models: ' + e.message } });
-  }
-});
-
-// OpenAI Chat Completions
-router.post('/v1/chat/completions', async (req, res) => {
-  const { messages, model, stream } = req.body || {};
-  if (!messages) return res.status(400).json({ error: { message: 'messages required' } });
-
-  const startTime = Date.now();
-  const logEntry = addCallLog({
-    id: uuid().slice(0, 8),
-    endpoint: '/v1/chat/completions',
-    model: model || 'auto',
-    messageCount: messages.length,
-    stream: !!stream,
-    status: 'pending',
-    duration: 0,
-    responsePreview: '',
-    error: null,
-  });
-
-  try {
-    const lm = await resolveModel(model);
-    logEntry.model = lm.displayName || lm.providerModelId || model;
-    logEntry.modelId = lm.id;
-    log(`/v1/chat/completions model=${model} → ${lm.providerModelId} msgs=${messages.length} stream=${stream}`);
-
-    if (stream) {
-      // 流式: 逐块转发
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
-      const id = 'chatcmpl-' + uuid().replace(/-/g, '').slice(0, 24);
-      const created = Math.floor(Date.now() / 1000);
-      const mk = (delta, fr) => `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model: model || 'auto', choices: [{ index: 0, delta, finish_reason: fr }] })}\n\n`;
-      // role chunk
-      res.write(mk({ role: 'assistant' }, null));
-      // 逐块转发 Langdock 的 text
-      await callLangdock(messages, lm, true, (text) => {
-        res.write(mk({ content: text }, null));
-      });
-      // 结束
-      res.write(mk({}, 'stop'));
-      res.write('data: [DONE]\n\n');
-      res.end();
-      logEntry.status = 'success';
-      logEntry.duration = Date.now() - startTime;
-    } else {
-      const ld = await callLangdock(messages, lm);
-      const text = extractText(ld);
-      logEntry.duration = Date.now() - startTime;
-      if (ld.status >= 400) {
-        logEntry.status = 'error';
-        logEntry.error = 'Langdock: ' + ld.body.slice(0, 200);
-        return res.status(ld.status).json({ error: { message: 'Langdock: ' + ld.body.slice(0, 500), type: 'upstream_error' } });
-      }
-      logEntry.status = 'success';
-      logEntry.responsePreview = text.slice(0, 200);
-      res.json(toOpenAIResponse(text, model));
-    }
-  } catch (e) {
-    log('error:', e.message);
-    logEntry.status = 'error';
-    logEntry.error = e.message;
-    logEntry.duration = Date.now() - startTime;
-    if (!res.headersSent) res.status(502).json({ error: { message: e.message, type: 'bridge_error' } });
-    else res.end();
-  }
-});
-
-// Anthropic Messages
-router.post('/v1/messages', async (req, res) => {
-  const { messages, model, system, stream } = req.body || {};
-  if (!messages) return res.status(400).json({ error: { type: 'invalid_request_error', message: 'messages required' } });
-
-  const startTime = Date.now();
-  const logEntry = addCallLog({
-    id: uuid().slice(0, 8),
-    endpoint: '/v1/messages',
-    model: model || 'auto',
-    messageCount: messages.length,
-    stream: !!stream,
-    status: 'pending',
-    duration: 0,
-    responsePreview: '',
-    error: null,
-  });
-
-  let msgs = (messages || []).map(m => {
-    let c = m.content;
-    if (Array.isArray(c)) c = c.filter(x => x.type === 'text').map(x => x.text).join('');
-    return { role: m.role, content: c };
-  });
-  if (system) msgs.unshift({ role: 'system', content: typeof system === 'string' ? system : JSON.stringify(system) });
-  try {
-    const lm = await resolveModel(model);
-    logEntry.model = lm.displayName || lm.providerModelId || model;
-    logEntry.modelId = lm.id;
-    log(`/v1/messages model=${model} → ${lm.providerModelId} msgs=${msgs.length} stream=${stream}`);
-    const msgId = 'msg_' + uuid().replace(/-/g, '');
-
-    if (stream) {
-      // Anthropic SSE 流式
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      const ev = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-      // message_start
-      ev('message_start', { type: 'message_start', message: { id: msgId, type: 'message', role: 'assistant', content: [], model: model || 'auto', stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 } } });
-      // content_block_start
-      ev('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
-      // 逐块 delta
-      await callLangdock(msgs, lm, true, (text) => {
-        ev('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } });
-      });
-      // 结束
-      ev('content_block_stop', { type: 'content_block_stop', index: 0 });
-      ev('message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 0 } });
-      ev('message_stop', { type: 'message_stop' });
-      res.end();
-      logEntry.status = 'success';
-      logEntry.duration = Date.now() - startTime;
-    } else {
-      const ld = await callLangdock(msgs, lm);
-      const text = extractText(ld);
-      logEntry.duration = Date.now() - startTime;
-      if (ld.status >= 400) {
-        logEntry.status = 'error';
-        logEntry.error = 'Langdock: ' + ld.body.slice(0, 200);
-        return res.status(ld.status).json({ error: { message: 'Langdock: ' + ld.body.slice(0, 500), type: 'upstream_error' } });
-      }
-      logEntry.status = 'success';
-      logEntry.responsePreview = text.slice(0, 200);
-      res.json(toClaudeResponse(text, model));
-    }
-  } catch (e) {
-    log('error:', e.message);
-    logEntry.status = 'error';
-    logEntry.error = e.message;
-    logEntry.duration = Date.now() - startTime;
-    if (!res.headersSent) res.status(502).json({ error: { message: e.message, type: 'bridge_error' } });
-    else res.end();
-  }
-});
-
-// OpenAI Responses (Codex)
-router.post('/v1/responses', async (req, res) => {
-  const { input, model, stream } = req.body || {};
-  let messages = [];
-  if (typeof input === 'string') messages = [{ role: 'user', content: input }];
-  else if (Array.isArray(input)) messages = input.map(m => {
-    let c = m.content;
-    if (Array.isArray(c)) c = c.map(x => x.text || '').join('');
-    return { role: m.role || 'user', content: c };
-  });
-  if (!messages.length) return res.status(400).json({ error: { message: 'input required' } });
-
-  const startTime = Date.now();
-  const logEntry = addCallLog({
-    id: uuid().slice(0, 8),
-    endpoint: '/v1/responses',
-    model: model || 'auto',
-    messageCount: messages.length,
-    stream: !!stream,
-    status: 'pending',
-    duration: 0,
-    responsePreview: '',
-    error: null,
-  });
-
-  try {
-    const lm = await resolveModel(model);
-    logEntry.model = lm.displayName || lm.providerModelId || model;
-    logEntry.modelId = lm.id;
-    log(`/v1/responses model=${model} → ${lm.providerModelId} msgs=${messages.length} stream=${stream}`);
-
-    if (stream) {
-      // Codex 流式: OpenAI Responses SSE 格式
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
-      const rid = 'resp_' + uuid().replace(/-/g, '');
-      const mk = (type, data) => `data: ${JSON.stringify({ type, ...data, id: rid })}\n\n`;
-      // response.created
-      res.write(mk('response.created', { response: { id: rid, object: 'response', model: model || 'auto', status: 'in_progress' } }));
-      // 逐块输出
-      await callLangdock(messages, lm, true, (text) => {
-        res.write(mk('response.output_text.delta', { delta: text }));
-      });
-      // 结束
-      res.write(mk('response.output_text.done', { text: '' }));
-      res.write(mk('response.completed', { response: { id: rid, object: 'response', model: model || 'auto', status: 'completed' } }));
-      res.end();
-      logEntry.status = 'success';
-      logEntry.duration = Date.now() - startTime;
-    } else {
-      const ld = await callLangdock(messages, lm);
-      const text = extractText(ld);
-      logEntry.duration = Date.now() - startTime;
-      if (ld.status >= 400) {
-        logEntry.status = 'error';
-        logEntry.error = 'Langdock: ' + ld.body.slice(0, 200);
-        return res.status(ld.status).json({ error: { message: 'Langdock: ' + ld.body.slice(0, 500), type: 'upstream_error' } });
-      }
-      logEntry.status = 'success';
-      logEntry.responsePreview = text.slice(0, 200);
-      res.json({
-        id: 'resp_' + uuid().replace(/-/g, ''),
-        object: 'response',
-        created_at: Math.floor(Date.now() / 1000),
-        model: model || 'auto',
-        output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] }],
-        status: 'completed',
-      });
-    }
-  } catch (e) {
-    log('error:', e.message);
-    logEntry.status = 'error';
-    logEntry.error = e.message;
-    logEntry.duration = Date.now() - startTime;
-    if (!res.headersSent) res.status(502).json({ error: { message: e.message } });
-    else res.end();
-  }
-});
-
+// ============================================================
+// 导出
+// ============================================================
 module.exports = router;
+module.exports.getCallLogs = getCallLogs;
+module.exports.getCallLogStats = getCallLogStats;
+module.exports.getModelStats = getModelStats;
+module.exports.getConversations = getConversations;
+module.exports.getConversation = getConversation;
+module.exports.deleteConversation = deleteConversation;
+module.exports.getTemplates = getTemplates;
+module.exports.addTemplate = addTemplate;
+module.exports.deleteTemplate = deleteTemplate;
+module.exports.healthCheck = healthCheck;
+module.exports.getConfig = getConfig;
+module.exports.updateConfig = updateConfig;
 module.exports.callLangdock = callLangdock;
 module.exports.extractText = extractText;
 module.exports.getModels = getModels;
-module.exports.getCallLogs = getCallLogs;
-module.exports.getCallLogStats = getCallLogStats;
