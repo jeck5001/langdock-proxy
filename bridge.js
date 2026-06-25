@@ -108,23 +108,84 @@ async function resolveModel(clientModel) {
   return { modelId: 'auto', providerModelId: 'auto' };
 }
 
+// ---------- 会话粘合 ----------
+// OpenAI/Claude API 是无状态的 (客户端每次发完整 messages),
+// 但 Langdock 是有状态的 (会话 ID 维护上下文).
+// 我们用消息内容哈希做 sessionKey, 同一对话复用同一个 Langdock 会话.
+//
+// 映射: sessionKey → { convId, lastMsgId, msgCount }
+const sessions = new Map();
+// 清理超过 2 小时没活动的会话, 避免内存泄漏
+const SESSION_TTL = 2 * 60 * 60 * 1000;
+
+function sessionKey(messages) {
+  // 用第一条消息的内容做 key (同一对话的第一条不会变, 后续请求都能匹配)
+  // 不同对话如果第一条恰好相同 (如都问"hi"), 会共用会话 — 概率低, 可接受
+  const first = messages[0];
+  const firstContent = typeof first?.content === 'string' ? first.content : JSON.stringify(first?.content || '');
+  // 加入 role, 区分 system 开头的对话
+  const tag = (first?.role || 'user') + '::' + firstContent;
+  return crypto.createHash('sha256').update(tag).digest('hex').slice(0, 16);
+}
+
+function getSession(key) {
+  const s = sessions.get(key);
+  if (s && (Date.now() - s.lastActive) < SESSION_TTL) return s;
+  return null;
+}
+
+function setSession(key, convId, lastMsgId, msgCount) {
+  sessions.set(key, { convId, lastMsgId, msgCount, lastActive: Date.now() });
+}
+
+// 清理过期会话 (每次调用时顺便检查)
+function cleanSessions() {
+  const now = Date.now();
+  for (const [k, s] of sessions) {
+    if (now - s.lastActive > SESSION_TTL) sessions.delete(k);
+  }
+}
+
 // ---------- 调 Langdock /api/engine ----------
 async function callLangdock(messages, langdockModel) {
-  // langdockModel = { id, providerModelId } 从 resolveModel 来
   const modelId = langdockModel?.id || 'auto';
   const providerModelId = langdockModel?.providerModelId || 'auto';
+
+  cleanSessions();
+  const key = sessionKey(messages);
+  const existing = getSession(key);
+
+  // 会话粘合逻辑:
+  //   - 新会话: 发全部 messages
+  //   - 已有会话: 只发最后一条新消息, parentId 指向上次的 lastMsgId
+  //   - 如果已有会话但消息数没增加 (重发), 还是发全部
+  let convId, parentId, msgToSend;
+
+  if (existing && messages.length > existing.msgCount) {
+    // 续接: 复用 convId, 只发新消息
+    convId = existing.convId;
+    parentId = existing.lastMsgId;
+    msgToSend = [messages[messages.length - 1]]; // 只发最后一条
+    log(`续接会话 ${convId.slice(0,8)}, parentId=${parentId.slice(0,8)}, 发 ${msgToSend.length} 条新消息`);
+  } else {
+    // 新会话或重发: 全新 convId, 发全部
+    convId = uuid();
+    parentId = uuid();
+    msgToSend = messages;
+    log(`新会话 ${convId.slice(0,8)}, 发 ${msgToSend.length} 条消息`);
+  }
 
   return new Promise((resolve, reject) => {
     if (!LANGDOCK_COOKIE) return reject(new Error('LANGDOCK_COOKIE 未设置'));
 
     const url = new URL(LANGDOCK_BASE + '/api/engine');
-    const threadId = uuid();
-    const parentId = uuid();
+    const threadId = convId; // threadId = convId, 保持一致
 
-    const ldMessages = messages.map((m, i) => {
-      const isLast = i === messages.length - 1;
+    const ldMessages = msgToSend.map((m, i) => {
+      const isLast = i === msgToSend.length - 1;
+      const msgId = uuid();
       return {
-        id: uuid(),
+        id: msgId,
         role: m.role === 'system' ? 'user' : m.role,
         parts: [{ type: 'text', text: m.content || '' }],
         metadata: isLast ? {
@@ -149,12 +210,13 @@ async function callLangdock(messages, langdockModel) {
       };
     });
 
-    const convId = uuid();
+    // 记下最后一条消息的 id, 用于下次续接
+    const lastMsgId = ldMessages[ldMessages.length - 1].id;
+
     const body = JSON.stringify({
       id: convId,
       conversationSource: 'WEB',
       userTimezone: 'Asia/Shanghai',
-      // kind 固定 auto; 具体模型通过 metadata.modelId/modelName 指定
       modelSelection: { kind: 'auto' },
       messages: ldMessages,
     });
@@ -191,6 +253,10 @@ async function callLangdock(messages, langdockModel) {
           console.log('  status:', res.statusCode, 'ct:', ct);
           console.log('  body (前 800):', full.slice(0, 800));
           console.log('[bridge] === end ===\n');
+        }
+        // 成功了才记录会话 (失败的话下次会重新建)
+        if (res.statusCode < 400) {
+          setSession(key, convId, lastMsgId, messages.length);
         }
         resolve({ status: res.statusCode, contentType: ct, body: full });
       });
