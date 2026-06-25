@@ -161,9 +161,8 @@ function getSessionKey(messages) {
 } // 2小时过期
 
 // ---------- 调 Langdock /api/engine ----------
-// 注意: Langdock API 每次请求都是独立的单轮对话
-// 它只处理 messages 数组里的最后一条消息, 不处理完整历史
-// 多轮对话上下文无法通过 API 传递 (Langdock 服务端维护, 仅浏览器 session 可用)
+// Langdock API 每次只处理单条消息, 不支持 messages 数组里的历史
+// 解决方案: 把客户端发的完整消息历史拼成 prompt, 让模型能看到上下文
 async function callLangdock(messages, langdockModel, streamMode, onChunk) {
   const isSpecific = langdockModel && langdockModel.id && langdockModel.id !== 'auto';
   const modelId = langdockModel?.id || 'auto';
@@ -174,13 +173,24 @@ async function callLangdock(messages, langdockModel, streamMode, onChunk) {
   const convId = uuid();
   const threadId = uuid();
 
-  // 只发最后一条消息 (Langdock API 只处理单条)
-  const newMsg = messages[messages.length - 1];
+  // 把消息历史拼成 prompt, 最后一条作为当前问题
+  let prompt;
+  if (messages.length === 1) {
+    prompt = messages[0].content || '';
+  } else {
+    const history = messages.slice(0, -1).map(m => {
+      const role = m.role === 'assistant' ? '助手' : (m.role === 'system' ? '系统' : '用户');
+      return `${role}: ${m.content || ''}`;
+    }).join('\n');
+    const lastMsg = messages[messages.length - 1];
+    prompt = `[对话历史]\n${history}\n\n[当前问题]\n${lastMsg.content || ''}`;
+  }
+
   const msgId = uuid();
   const ldMessages = [{
     id: msgId,
-    role: newMsg.role === 'system' ? 'user' : newMsg.role,
-    parts: [{ type: 'text', text: newMsg.content || '' }],
+    role: 'user',
+    parts: [{ type: 'text', text: prompt }],
     metadata: {
       createdAt: new Date().toISOString(),
       threadId,
