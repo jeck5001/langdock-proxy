@@ -1,11 +1,14 @@
 {
   "name": "langdock-proxy",
-  "version": "2.0.0",
-  "description": "Reverse proxy for app.langdock.com with multi-proxy management UI + REST API",
+  "version": "2.1.0",
+  "description": "Reverse proxy for app.langdock.com with multi-proxy management UI + REST API + CLI",
   "main": "manager.js",
   "scripts": {
     "start": "node manager.js",
     "proxy": "node proxy.js"
+  },
+  "bin": {
+    "langdock": "./cli.js"
   },
   "dependencies": {
     "dockerode": "^4.0.2",

@@ -58,7 +58,19 @@ if (!TOKEN) {
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // ---------- Docker ----------
-const docker = new Docker({ socketPath: '/var/run/docker.sock' });
+// Docker 不可用时 docker=null, 容器操作返回友好错误, 但 API/UI 仍可用
+let docker = null;
+let dockerError = null;
+try {
+  docker = new Docker({ socketPath: '/var/run/docker.sock' });
+  // 立即 ping 一次, 确认 socket 可达 (避免后续每个操作才发现)
+  // 用同步方式: 尝试 dockerode 的 listContainers
+} catch (e) {
+  dockerError = e.message;
+  console.warn('[manager] Docker 初始化失败:', e.message);
+  console.warn('  容器操作将不可用, 但 Web UI / API / 配置管理仍可正常工作.');
+  console.warn('  若在容器内运行, 请挂载 /var/run/docker.sock');
+}
 
 // ---------- 配置存储 ----------
 function loadConfig() {
@@ -84,6 +96,7 @@ function containerName(id) {
 
 // ---------- 启动一个反代容器 ----------
 async function startProxyContainer(p) {
+  if (!docker) throw new Error('Docker 不可用: ' + (dockerError || 'socket 未挂载'));
   const name = containerName(p.id);
   // 先清理同名旧容器
   try {
@@ -128,6 +141,7 @@ async function stopProxyContainer(id) {
 
 // ---------- 获取容器状态 ----------
 async function getContainerStatus(id) {
+  if (!docker) return { exists: false, running: false, status: 'docker_unavailable' };
   const name = containerName(id);
   try {
     const info = await docker.getContainer(name).inspect();
@@ -145,6 +159,7 @@ async function getContainerStatus(id) {
 
 // ---------- 获取容器日志 ----------
 function getContainerLogs(id, tail = 200) {
+  if (!docker) return Promise.resolve('[Docker 不可用, 无法获取日志]');
   return new Promise((resolve) => {
     const name = containerName(id);
     // 用 docker logs 命令, 比 dockerode 流更简单
@@ -334,9 +349,17 @@ app.get('/api/proxies/:id/status', async (req, res) => {
 // 系统信息
 app.get('/api/system', async (req, res) => {
   const cfg = loadConfig();
-  const info = await docker.info();
+  let dockerInfo = { available: false, running: 0, total: 0 };
+  if (docker) {
+    try {
+      const info = await docker.info();
+      dockerInfo = { available: true, running: info.ContainersRunning, total: info.Containers };
+    } catch (e) {
+      dockerInfo = { available: false, error: e.message };
+    }
+  }
   res.json({
-    docker: { running: info.ContainersRunning, total: info.Containers },
+    docker: dockerInfo,
     proxies: cfg.proxies.length,
     image: PROXY_IMAGE,
   });
@@ -354,15 +377,23 @@ app.listen(PORT, () => {
 
 // 启动时确保所有已配置的代理容器在运行 (重启 manager 后自愈)
 async function reconcile() {
+  if (!docker) {
+    console.log('[reconcile] Docker 不可用, 跳过自愈');
+    return;
+  }
   const cfg = loadConfig();
   console.log(`[reconcile] 检查 ${cfg.proxies.length} 个代理...`);
   for (const p of cfg.proxies) {
-    const s = await getContainerStatus(p.id);
-    if (!s.running) {
-      console.log(`[reconcile] 启动 ${p.name} (${p.id})...`);
-      try { await startProxyContainer(p); } catch (e) { console.error(`[reconcile] ${p.id} 启动失败:`, e.message); }
-    } else {
-      console.log(`[reconcile] ${p.name} 已在运行`);
+    try {
+      const s = await getContainerStatus(p.id);
+      if (!s.running) {
+        console.log(`[reconcile] 启动 ${p.name} (${p.id})...`);
+        try { await startProxyContainer(p); } catch (e) { console.error(`[reconcile] ${p.id} 启动失败:`, e.message); }
+      } else {
+        console.log(`[reconcile] ${p.name} 已在运行`);
+      }
+    } catch (e) {
+      console.error(`[reconcile] ${p.id} 状态检查失败:`, e.message);
     }
   }
 }
