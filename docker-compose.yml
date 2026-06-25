@@ -1,21 +1,5 @@
 services:
-  # 反代管理平台 (Web UI + REST API + Docker 编排)
-  manager:
-    image: ghcr.io/jeck5001/langdock-proxy-manager:latest
-    container_name: langdock-proxy-manager
-    restart: unless-stopped
-    ports:
-      - "8080:8080"
-    environment:
-      MANAGER_PORT: "8080"
-      MANAGER_TOKEN: "${MANAGER_TOKEN:-changeme-please}"
-      DATA_DIR: "/data"
-      PROXY_IMAGE: "ghcr.io/jeck5001/langdock-proxy:latest"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ./data:/data
-
-  # LLM Bridge (把 Langdock 账号转成 OpenAI/Claude/Codex 兼容 API)
+  # LLM Bridge — 把 Langdock 账号转成 OpenAI/Claude/Codex 兼容 API
   # 在 Claude Code / Codex / Cursor 里配置成 Base URL 即可使用
   bridge:
     image: ghcr.io/jeck5001/langdock-proxy-manager:latest
@@ -25,13 +9,29 @@ services:
       - "8963:8963"
     environment:
       BRIDGE_PORT: "8963"
-      # 从 app.langdock.com 浏览器抓取 Cookie, 设到 .env 或这里
-      # 注意: Cookie 会过期, 需要定期更新
-      LANGDOCK_COOKIE: "${LANGDOCK_COOKIE:-}"
-      LANGDOCK_BASE: "https://app.langdock.com"
-      # 可选: 给 bridge API 加个 token 保护 (不填则不校验)
+      # 必填: 从 app.langdock.com 浏览器抓取 Cookie (F12 → Network → /api/engine → Cookie 头)
+      LANGDOCK_COOKIE: "${LANGDOCK_COOKIE}"
+      # 可选: 保护 API 的 token (不填则不校验; 客户端 Authorization: Bearer <token>)
       BRIDGE_TOKEN: "${BRIDGE_TOKEN:-}"
       DEBUG: "${DEBUG:-0}"
-    # bridge.js 和 manager.js 在同一个镜像里
-    # 用 command 覆盖, 跑 bridge 而不是 manager
     command: ["node", "bridge.js"]
+
+  # 反代管理平台 (可选, 默认不启动)
+  # 想用 Web UI 管多个反代容器时, 加 --profile manager 启动:
+  #   docker compose --profile manager up -d
+  manager:
+    image: ghcr.io/jeck5001/langdock-proxy-manager:latest
+    container_name: langdock-proxy-manager
+    profiles: ["manager"]
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      MANAGER_PORT: "8080"
+      MANAGER_TOKEN: "${MANAGER_TOKEN:-changeme}"
+      DATA_DIR: "/data"
+      PROXY_IMAGE: "ghcr.io/jeck5001/langdock-proxy:latest"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/data
+    command: ["node", "manager.js"]
