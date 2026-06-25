@@ -8,7 +8,7 @@ services:
     container_name: langdock-proxy
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "8500:8080"
     environment:
       MANAGER_PORT: "8080"
       # 访问 token: 既是管理 UI 的登录密码, 也是 LLM API 的 Bearer token
