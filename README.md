@@ -1,8 +1,11 @@
-# Langdock Proxy Manager
+# Langdock Proxy
 
-多代理反代管理平台: 通过 Web UI 或 REST API 管理多个反向代理实例, 每个实例是一个 Docker 容器, 基于 [http-proxy-middleware](https://github.com/chimurai/http-proxy-middleware) 实现, 支持 WebSocket, Cookie/URL 重写.
+围绕 [app.langdock.com](https://app.langdock.com) 的两个工具:
 
-专为反代 [app.langdock.com](https://app.langdock.com) 设计, 但可以反代任意目标.
+1. **Manager** — 多代理反代管理平台: Web UI + REST API + Docker 编排, 管理多个反代容器
+2. **Bridge** — LLM API 转换: 把 Langdock 账号转成 OpenAI / Claude / Codex 兼容 API, 让 Claude Code / Codex / Cursor 直接当 LLM 后端用 (类似 QCCG)
+
+两者打包在同一个 Docker 镜像里, 由 docker-compose 的 command 字段决定跑哪个.
 
 ## 架构
 
@@ -186,3 +189,101 @@ PROXY_TARGET=https://app.langdock.com PROXY_PORT=3000 node proxy.js
 ## License
 
 MIT
+
+---
+
+# Bridge: Langdock → OpenAI/Claude/Codex API
+
+把 Langdock 账号转成兼容 API, 让 Claude Code / Codex / Cursor 直接当 LLM 后端用.
+
+## 原理
+
+```
+Claude Code / Codex / Cursor
+    │  (OpenAI / Claude / Codex 格式)
+    ▼
+Bridge (bridge.js)  ← 本服务
+    │  (Langdock /api/engine 格式, Cookie 认证)
+    ▼
+app.langdock.com  → Claude / GPT
+```
+
+Bridge 接收标准 OpenAI/Anthropic 格式请求, 转成 Langdock 的 `/api/engine` 格式, 用你提供的 Cookie 调用 Langdock, 再把响应转回标准格式.
+
+## 暴露的端点
+
+| 端点 | 格式 | 客户端 |
+|---|---|---|
+| `POST /v1/chat/completions` | OpenAI Chat | Cursor / Continue / OpenAI SDK |
+| `POST /v1/messages` | Anthropic Claude | Claude Code |
+| `POST /v1/responses` | OpenAI Responses | Codex |
+| `GET /v1/models` | OpenAI | 所有 |
+
+## 部署
+
+Bridge 已经包含在 `docker-compose.yml` 里, 和 manager 一起部署:
+
+```bash
+# 1. 创建 .env 文件, 填入 Langdock Cookie
+cat > .env <<EOF
+MANAGER_TOKEN=your-manager-password
+LANGDOCK_COOKIE=你从浏览器抓的完整 Cookie
+BRIDGE_TOKEN=your-bridge-password  # 可选, 保护 bridge API
+EOF
+
+# 2. 启动
+docker compose up -d
+```
+
+## 抓取 Langdock Cookie
+
+1. 浏览器打开 `app.langdock.com`, 登录
+2. F12 打开开发者工具 → Network 标签
+3. 发一条聊天消息, 找到 `/api/engine` 请求
+4. 右键 → Copy → Copy as cURL, 或在 Headers 里找到 `Cookie:` 头
+5. 复制整个 Cookie 值, 填到 `.env` 的 `LANGDOCK_COOKIE=`
+
+**注意**: Cookie 会过期, 需要定期更新. 如果 bridge 返回错误, 先检查 Cookie 是否失效.
+
+## 客户端配置
+
+### Claude Code
+
+```bash
+# 设置环境变量
+export ANTHROPIC_BASE_URL=http://<nas-ip>:8963
+export ANTHROPIC_API_KEY=<你的 BRIDGE_TOKEN, 没设则任意>
+```
+
+### Codex
+
+```bash
+export OPENAI_BASE_URL=http://<nas-ip>:8963/v1
+export OPENAI_API_KEY=<你的 BRIDGE_TOKEN, 没设则任意>
+```
+
+### Cursor
+
+Settings → Models → OpenAI API Key 填 BRIDGE_TOKEN, Base URL 填:
+```
+http://<nas-ip>:8963/v1
+```
+
+## 调试
+
+如果响应不正常, 开 DEBUG 看原始响应:
+
+```bash
+# .env 里设
+DEBUG=1
+docker compose restart bridge
+docker compose logs -f bridge
+```
+
+DEBUG 模式会打印 Langdock 的原始响应, 可以看到响应格式, 方便定位问题.
+
+## 局限
+
+- Cookie 认证: Langdock 用 Cookie 维持会话, Cookie 过期需要重新抓取
+- Cloudflare: Langdock 有 CF 防护, 如果 NAS IP 和登录 IP 差异大, `cf_clearance` 可能失效
+- 非流式: 当前响应是"收集完整再返回", 不是真正的流式 (后续可改)

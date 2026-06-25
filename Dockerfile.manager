@@ -1,14 +1,17 @@
-# 管理平台镜像 (Web UI + REST API + Docker 编排)
+# 管理平台镜像
+# 包含: manager.js (反代管理) + bridge.js (LLM API 转换) + cli.js (命令行)
+# 跑哪个由 docker-compose command 决定
 FROM node:22-alpine
 
-# 装 docker CLI (manager 用 docker logs 命令拉取容器日志)
+# docker CLI: manager 用它拉容器日志; bridge 不需要但装上无害
 RUN apk add --no-cache docker-cli
 
 WORKDIR /app
 COPY package.json ./
 RUN npm install --omit=dev && npm cache clean --force
-COPY manager.js ./
+COPY manager.js bridge.js cli.js ./
 COPY public ./public
 
-EXPOSE 8080
+# 默认跑 manager; bridge 服务在 compose 里用 command 覆盖
+EXPOSE 8080 8963
 CMD ["node", "manager.js"]
