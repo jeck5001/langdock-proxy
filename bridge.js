@@ -119,13 +119,11 @@ const sessions = new Map();
 const SESSION_TTL = 2 * 60 * 60 * 1000;
 
 function sessionKey(messages) {
-  // 用第一条消息的内容做 key (同一对话的第一条不会变, 后续请求都能匹配)
-  // 不同对话如果第一条恰好相同 (如都问"hi"), 会共用会话 — 概率低, 可接受
-  const first = messages[0];
-  const firstContent = typeof first?.content === 'string' ? first.content : JSON.stringify(first?.content || '');
-  // 加入 role, 区分 system 开头的对话
-  const tag = (first?.role || 'user') + '::' + firstContent;
-  return crypto.createHash('sha256').update(tag).digest('hex').slice(0, 16);
+  // 用第一条 user 消息的内容做 key (跳过 system, 因为 system 可能变化或每次相同)
+  // 同一对话的第一条 user 不会变, 后续请求都能匹配
+  const firstUser = messages.find(m => m.role === 'user') || messages[0];
+  const firstContent = typeof firstUser?.content === 'string' ? firstUser.content : JSON.stringify(firstUser?.content || '');
+  return crypto.createHash('sha256').update('user::' + firstContent).digest('hex').slice(0, 16);
 }
 
 function getSession(key) {
