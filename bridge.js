@@ -148,8 +148,13 @@ function cleanSessions() {
 
 // ---------- 调 Langdock /api/engine ----------
 async function callLangdock(messages, langdockModel) {
+  // langdockModel = { id, providerModelId, provider, displayName } 从 resolveModel 来
+  // 指定模型: modelSelection = { kind: "modelId", modelId: <uuid> }
+  // auto: modelSelection = { kind: "auto" }
+  const isSpecific = langdockModel && langdockModel.id && langdockModel.id !== 'auto';
   const modelId = langdockModel?.id || 'auto';
-  const providerModelId = langdockModel?.providerModelId || 'auto';
+  const modelProvider = langdockModel?.provider || null;
+  const modelName = langdockModel?.displayName || null;
 
   cleanSessions();
   const key = sessionKey(messages);
@@ -198,11 +203,10 @@ async function callLangdock(messages, langdockModel) {
           taggedKnowledgeFolders: [],
           taggedWorkflows: [],
           taggedAssistantId: null,
-          modelId: modelId,
-          modelProvider: null,
-          modelName: providerModelId,
+          modelId: isSpecific ? modelId : null,
+          modelProvider: isSpecific ? modelProvider : null,
+          modelName: isSpecific ? modelName : null,
           userFeedback: null,
-          autoModelTier: 'auto',
         } : {
           createdAt: new Date().toISOString(),
           threadId, parentId,
@@ -217,7 +221,11 @@ async function callLangdock(messages, langdockModel) {
       id: convId,
       conversationSource: 'WEB',
       userTimezone: 'Asia/Shanghai',
-      modelSelection: { kind: 'auto' },
+      // 指定模型: kind=modelId + modelId=<uuid>; auto: kind=auto
+      modelSelection: isSpecific
+        ? { kind: 'modelId', modelId: modelId }
+        : { kind: 'auto' },
+      extendedThinking: true,
       messages: ldMessages,
     });
 
