@@ -41,16 +41,13 @@ cd langdock-proxy
 # 2. 改 docker-compose.yml 里的 MANAGER_TOKEN 成你自己的强密码
 #    (必改! 默认是 changeme-please)
 
-# 3. 预拉取反代镜像 (manager 创建代理时会用到)
-docker compose --profile pull pull
-
-# 4. 启动 manager
+# 3. 启动 manager
 docker compose up -d
 
-# 5. 看 token (如果没改 MANAGER_TOKEN 的话, 这里会显示随机生成的)
+# 4. 看 token (如果没改 MANAGER_TOKEN 的话, 这里会显示随机生成的)
 docker compose logs manager | grep Token
 
-# 6. 打开 Web UI
+# 5. 打开 Web UI
 open http://<nas-ip>:8080
 ```
 

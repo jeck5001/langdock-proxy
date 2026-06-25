@@ -5,6 +5,9 @@
 # 前置: 需要设置 MANAGER_TOKEN 环境变量 (或改下面的值)
 #   export MANAGER_TOKEN="your-strong-password"
 # 或直接编辑下面的 MANAGER_TOKEN 行
+#
+# manager 启动后, 在 UI 里创建代理时, Docker 会自动拉取反代镜像
+# (ghcr.io/jeck5001/langdock-proxy:latest), 无需手动预拉取
 
 services:
   manager:
@@ -18,19 +21,10 @@ services:
       # 访问 token — 务必改成你自己的强密码!
       MANAGER_TOKEN: "${MANAGER_TOKEN:-changeme-please}"
       DATA_DIR: "/data"
-      # manager 用这个镜像创建反代容器 (和下面 proxy 服务用的同一个镜像)
+      # manager 用这个镜像创建反代容器 (Docker 会自动拉取)
       PROXY_IMAGE: "ghcr.io/jeck5001/langdock-proxy:latest"
     volumes:
       # 挂载 docker.sock, 让 manager 能控制宿主 Docker
       - /var/run/docker.sock:/var/run/docker.sock
       # 配置持久化 (proxies.json)
       - ./data:/data
-
-  # 反代引擎镜像 (manager 用它创建每个代理实例)
-  # 这个服务本身不运行, 只是声明镜像来源, 方便预拉取:
-  #   docker compose --profile pull pull
-  # 真正的反代容器由 manager 通过 dockerode 动态创建
-  proxy-image:
-    image: ghcr.io/jeck5001/langdock-proxy:latest
-    profiles: ["pull"]
-    command: ["echo", "image pulled"]
