@@ -1,0 +1,14 @@
+# 管理平台镜像 (Web UI + REST API + Docker 编排)
+FROM node:22-alpine
+
+# 装 docker CLI (manager 用 docker logs 命令拉取容器日志)
+RUN apk add --no-cache docker-cli
+
+WORKDIR /app
+COPY package.json ./
+RUN npm install --omit=dev && npm cache clean --force
+COPY manager.js ./
+COPY public ./public
+
+EXPOSE 8080
+CMD ["node", "manager.js"]

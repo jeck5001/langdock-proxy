@@ -1,0 +1,35 @@
+services:
+  # 反代引擎镜像 (manager 用来启动每个代理实例)
+  # 只需构建一次, manager 会用这个镜像创建代理容器
+  proxy-image:
+    image: langdock-proxy:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # 这个服务本身不运行, 只是为了构建镜像; 用 profiles 把它默认隐藏
+    profiles: ["build"]
+    command: ["echo", "image built"]
+
+  # 管理平台
+  manager:
+    build:
+      context: .
+      dockerfile: Dockerfile.manager
+    image: langdock-proxy-manager:latest
+    container_name: langdock-proxy-manager
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      MANAGER_PORT: "8080"
+      # 访问 token — 务必改成你自己的强密码!
+      MANAGER_TOKEN: "changeme-please"
+      DATA_DIR: "/data"
+      # manager 用来创建反代容器的镜像名 (必须和上面 proxy-image 构建出的镜像名一致)
+      PROXY_IMAGE: "langdock-proxy:latest"
+    volumes:
+      # 挂载 docker.sock, 让 manager 能控制宿主 Docker
+      - /var/run/docker.sock:/var/run/docker.sock
+      # 配置持久化
+      - ./data:/data
+      # 挂载本目录, 让 manager 能访问 proxy.js 等 (其实镜像已内置, 这里备用)

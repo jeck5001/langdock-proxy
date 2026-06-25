@@ -1,0 +1,7 @@
+node_modules
+npm-debug.log
+.DS_Store
+*.md
+selftest.js
+allinone.js
+e2e_test.js
