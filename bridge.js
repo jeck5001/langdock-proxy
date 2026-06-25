@@ -8,7 +8,7 @@
  *   POST /v1/chat/completions   OpenAI Chat
  *   POST /v1/messages           Anthropic Claude
  *   POST /v1/responses          OpenAI Responses (Codex)
- *   GET  /v1/models             模型列表
+ *   GET  /v1/models             模型列表 (从 Langdock /api/models 动态拉取)
  */
 
 const express = require('express');
@@ -18,7 +18,7 @@ const crypto = require('crypto');
 
 function uuid() { return crypto.randomUUID(); }
 
-// ---------- 配置 (从环境变量读) ----------
+// ---------- 配置 ----------
 const LANGDOCK_BASE = process.env.LANGDOCK_BASE || 'https://app.langdock.com';
 const LANGDOCK_COOKIE = process.env.LANGDOCK_COOKIE || '';
 const DEBUG = process.env.DEBUG === '1';
@@ -27,8 +27,93 @@ function log(...args) {
   if (DEBUG) console.log('[bridge]', ...args);
 }
 
+// ---------- 模型缓存 ----------
+// 从 Langdock /api/models 拉取, 缓存 10 分钟
+let modelsCache = null;
+let modelsCacheTime = 0;
+const CACHE_TTL = 10 * 60 * 1000;
+
+// Langdock 模型 ID (UUID) → providerModelId (如 "claude-opus-4-8") 的映射
+// 客户端传的 model 名要匹配 providerModelId 或 displayName
+function fetchModels() {
+  return new Promise((resolve, reject) => {
+    const url = new URL(LANGDOCK_BASE + '/api/models');
+    const req = https.request({
+      method: 'GET',
+      hostname: url.hostname,
+      path: url.pathname,
+      headers: {
+        'Cookie': LANGDOCK_COOKIE,
+        'x-app-version': 'v7.17.0',
+        'Accept': '*/*',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
+      },
+    }, (res) => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => {
+        try {
+          const arr = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          resolve(arr);
+        } catch (e) { reject(e); }
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(10000, () => { req.destroy(); reject(new Error('models 超时')); });
+    req.end();
+  });
+}
+
+async function getModels() {
+  const now = Date.now();
+  if (modelsCache && (now - modelsCacheTime) < CACHE_TTL) {
+    return modelsCache;
+  }
+  try {
+    const arr = await fetchModels();
+    modelsCache = arr;
+    modelsCacheTime = now;
+    log('已拉取模型列表:', arr.length, '个');
+    return arr;
+  } catch (e) {
+    log('拉取模型列表失败:', e.message);
+    // 返回缓存 (即使过期) 或空
+    return modelsCache || [];
+  }
+}
+
+// 客户端传的 model 名 → Langdock 模型对象
+// 匹配顺序: providerModelId 完全匹配 → displayName 匹配 → provider 匹配 → 默认 auto
+async function resolveModel(clientModel) {
+  if (!clientModel || clientModel === 'auto' || clientModel === 'langdock-auto') {
+    return { modelId: 'auto', providerModelId: 'auto' };
+  }
+  const models = await getModels();
+  // 1) providerModelId 匹配 (如 "claude-opus-4-8", "gpt-5.5")
+  let m = models.find(x => x.providerModelId === clientModel);
+  if (m) return m;
+  // 2) displayName 匹配 (如 "Opus 4.8")
+  m = models.find(x => x.displayName === clientModel);
+  if (m) return m;
+  // 3) 模糊匹配: clientModel 包含在 providerModelId 或 displayName 里
+  //    如 "opus" → 找到第一个含 opus 的
+  const lower = clientModel.toLowerCase();
+  m = models.find(x =>
+    (x.providerModelId || '').toLowerCase().includes(lower) ||
+    (x.displayName || '').toLowerCase().includes(lower)
+  );
+  if (m) return m;
+  // 4) 兜底: auto
+  log('未找到模型:', clientModel, '→ 用 auto');
+  return { modelId: 'auto', providerModelId: 'auto' };
+}
+
 // ---------- 调 Langdock /api/engine ----------
-function callLangdock(messages, modelSelection) {
+async function callLangdock(messages, langdockModel) {
+  // langdockModel = { id, providerModelId } 从 resolveModel 来
+  const modelId = langdockModel?.id || 'auto';
+  const providerModelId = langdockModel?.providerModelId || 'auto';
+
   return new Promise((resolve, reject) => {
     if (!LANGDOCK_COOKIE) return reject(new Error('LANGDOCK_COOKIE 未设置'));
 
@@ -52,8 +137,11 @@ function callLangdock(messages, modelSelection) {
           taggedKnowledgeFolders: [],
           taggedWorkflows: [],
           taggedAssistantId: null,
-          modelId: modelSelection || 'auto',
-          modelProvider: null, modelName: null, userFeedback: null, autoModelTier: 'auto',
+          modelId: modelId,
+          modelProvider: null,
+          modelName: providerModelId,
+          userFeedback: null,
+          autoModelTier: 'auto',
         } : {
           createdAt: new Date().toISOString(),
           threadId, parentId,
@@ -66,8 +154,7 @@ function callLangdock(messages, modelSelection) {
       id: convId,
       conversationSource: 'WEB',
       userTimezone: 'Asia/Shanghai',
-      // Langdock 的 kind 只接受 'auto'; 指定模型应该通过 metadata.modelId
-      // 目前统一用 auto, 让 Langdock 自己选模型
+      // kind 固定 auto; 具体模型通过 metadata.modelId/modelName 指定
       modelSelection: { kind: 'auto' },
       messages: ldMessages,
     });
@@ -100,9 +187,9 @@ function callLangdock(messages, modelSelection) {
       res.on('end', () => {
         const full = Buffer.concat(chunks).toString('utf8');
         if (DEBUG) {
-          console.log('\n[bridge] === Langdock 原始响应 ===');
-          console.log('  status:', res.statusCode, 'content-type:', ct);
-          console.log('  body (前 1000):\n', full.slice(0, 1000));
+          console.log('\n[bridge] === Langdock 响应 ===');
+          console.log('  status:', res.statusCode, 'ct:', ct);
+          console.log('  body (前 800):', full.slice(0, 800));
           console.log('[bridge] === end ===\n');
         }
         resolve({ status: res.statusCode, contentType: ct, body: full });
@@ -110,14 +197,13 @@ function callLangdock(messages, modelSelection) {
       res.on('error', reject);
     });
     req.on('error', reject);
-    req.setTimeout(60000, () => { req.destroy(); reject(new Error('Langdock 超时')); });
+    req.setTimeout(120000, () => { req.destroy(); reject(new Error('Langdock 超时')); });
     req.write(body);
     req.end();
   });
 }
 
-// ---------- 解析 Langdock 响应 → 纯文本 ----------
-// Langdock 用 Vercel AI SDK SSE: 0:"text" d:{"finishReason":"stop"}
+// ---------- 解析 Langdock 响应 (Vercel AI SDK SSE) → 纯文本 ----------
 function extractText(langdockResp) {
   const { body } = langdockResp;
   const texts = [];
@@ -153,7 +239,6 @@ function extractText(langdockResp) {
   }
   if (texts.length) return texts.join('');
 
-  // JSON 单体
   try {
     const obj = JSON.parse(body);
     return obj.text || obj.content || obj.message
@@ -168,7 +253,7 @@ function toOpenAIResponse(text, model) {
     id: 'chatcmpl-' + uuid().replace(/-/g, '').slice(0, 24),
     object: 'chat.completion',
     created: Math.floor(Date.now() / 1000),
-    model: model || 'langdock-auto',
+    model: model || 'auto',
     choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
   };
@@ -180,7 +265,7 @@ function toOpenAIStream(text, model, res) {
   res.setHeader('Connection', 'keep-alive');
   const id = 'chatcmpl-' + uuid().replace(/-/g, '').slice(0, 24);
   const created = Math.floor(Date.now() / 1000);
-  const mk = (delta, fr) => `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model: model || 'langdock-auto', choices: [{ index: 0, delta, finish_reason: fr }] })}\n\n`;
+  const mk = (delta, fr) => `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model: model || 'auto', choices: [{ index: 0, delta, finish_reason: fr }] })}\n\n`;
   res.write(mk({ role: 'assistant' }, null));
   res.write(mk({ content: text }, null));
   res.write(mk({}, 'stop'));
@@ -192,7 +277,7 @@ function toClaudeResponse(text, model) {
   return {
     id: 'msg_' + uuid().replace(/-/g, ''),
     type: 'message', role: 'assistant',
-    model: model || 'langdock-auto',
+    model: model || 'auto',
     content: [{ type: 'text', text }],
     stop_reason: 'end_turn', stop_sequence: null,
     usage: { input_tokens: 0, output_tokens: 0 },
@@ -202,32 +287,33 @@ function toClaudeResponse(text, model) {
 // ---------- Express Router ----------
 const router = express.Router();
 
-// 模型列表
-router.get('/v1/models', (req, res) => {
-  res.json({
-    object: 'list',
-    data: [
-      { id: 'langdock-auto', object: 'model', created: 1700000000, owned_by: 'langdock' },
-      { id: 'langdock-claude', object: 'model', created: 1700000000, owned_by: 'langdock' },
-      { id: 'langdock-gpt', object: 'model', created: 1700000000, owned_by: 'langdock' },
-    ],
-  });
+// 模型列表 (动态从 Langdock 拉取)
+router.get('/v1/models', async (req, res) => {
+  try {
+    const models = await getModels();
+    res.json({
+      object: 'list',
+      data: models.map(m => ({
+        id: m.providerModelId,
+        object: 'model',
+        created: 1700000000,
+        owned_by: m.provider || 'langdock',
+        display_name: m.displayName,
+      })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: { message: 'Failed to fetch models: ' + e.message } });
+  }
 });
 
 // OpenAI Chat Completions
 router.post('/v1/chat/completions', async (req, res) => {
   const { messages, model, stream } = req.body || {};
   if (!messages) return res.status(400).json({ error: { message: 'messages required' } });
-  const modelMap = (m) => {
-    if (!m || m.includes('auto')) return 'auto';
-    if (m.includes('claude')) return 'claude';
-    if (m.includes('gpt')) return 'gpt';
-    return 'auto';
-  };
-  const ms = modelMap(model);
-  log(`/v1/chat/completions model=${model} → ${ms} msgs=${messages.length} stream=${stream}`);
   try {
-    const ld = await callLangdock(messages, ms);
+    const lm = await resolveModel(model);
+    log(`/v1/chat/completions model=${model} → ${lm.providerModelId} msgs=${messages.length} stream=${stream}`);
+    const ld = await callLangdock(messages, lm);
     const text = extractText(ld);
     if (ld.status >= 400) return res.status(ld.status).json({ error: { message: 'Langdock: ' + ld.body.slice(0, 500), type: 'upstream_error' } });
     if (stream) return toOpenAIStream(text, model, res);
@@ -248,10 +334,10 @@ router.post('/v1/messages', async (req, res) => {
     return { role: m.role, content: c };
   });
   if (system) msgs.unshift({ role: 'system', content: typeof system === 'string' ? system : JSON.stringify(system) });
-  const ms = model && model.includes('gpt') ? 'gpt' : 'claude';
-  log(`/v1/messages model=${model} → ${ms} msgs=${msgs.length}`);
   try {
-    const ld = await callLangdock(msgs, ms);
+    const lm = await resolveModel(model);
+    log(`/v1/messages model=${model} → ${lm.providerModelId} msgs=${msgs.length}`);
+    const ld = await callLangdock(msgs, lm);
     const text = extractText(ld);
     if (ld.status >= 400) return res.status(ld.status).json({ error: { message: 'Langdock: ' + ld.body.slice(0, 500), type: 'upstream_error' } });
     res.json(toClaudeResponse(text, model));
@@ -271,16 +357,16 @@ router.post('/v1/responses', async (req, res) => {
     if (Array.isArray(c)) c = c.map(x => x.text || '').join('');
     return { role: m.role || 'user', content: c };
   });
-  const ms = model && model.includes('gpt') ? 'gpt' : 'auto';
-  log(`/v1/responses model=${model} msgs=${messages.length}`);
   try {
-    const ld = await callLangdock(messages, ms);
+    const lm = await resolveModel(model);
+    log(`/v1/responses model=${model} → ${lm.providerModelId} msgs=${messages.length}`);
+    const ld = await callLangdock(messages, lm);
     const text = extractText(ld);
     res.json({
       id: 'resp_' + uuid().replace(/-/g, ''),
       object: 'response',
       created_at: Math.floor(Date.now() / 1000),
-      model: model || 'langdock-auto',
+      model: model || 'auto',
       output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] }],
       status: 'completed',
     });
@@ -292,3 +378,4 @@ router.post('/v1/responses', async (req, res) => {
 module.exports = router;
 module.exports.callLangdock = callLangdock;
 module.exports.extractText = extractText;
+module.exports.getModels = getModels;
