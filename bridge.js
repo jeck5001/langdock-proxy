@@ -522,7 +522,7 @@ router.post('/v1/messages', async (req, res) => {
 
 // OpenAI Responses (Codex)
 router.post('/v1/responses', async (req, res) => {
-  const { input, model } = req.body || {};
+  const { input, model, stream } = req.body || {};
   let messages = [];
   if (typeof input === 'string') messages = [{ role: 'user', content: input }];
   else if (Array.isArray(input)) messages = input.map(m => {
@@ -530,21 +530,44 @@ router.post('/v1/responses', async (req, res) => {
     if (Array.isArray(c)) c = c.map(x => x.text || '').join('');
     return { role: m.role || 'user', content: c };
   });
+  if (!messages.length) return res.status(400).json({ error: { message: 'input required' } });
   try {
     const lm = await resolveModel(model);
-    log(`/v1/responses model=${model} → ${lm.providerModelId} msgs=${messages.length}`);
-    const ld = await callLangdock(messages, lm);
-    const text = extractText(ld);
-    res.json({
-      id: 'resp_' + uuid().replace(/-/g, ''),
-      object: 'response',
-      created_at: Math.floor(Date.now() / 1000),
-      model: model || 'auto',
-      output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] }],
-      status: 'completed',
-    });
+    log(`/v1/responses model=${model} → ${lm.providerModelId} msgs=${messages.length} stream=${stream}`);
+
+    if (stream) {
+      // Codex 流式: OpenAI Responses SSE 格式
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      const rid = 'resp_' + uuid().replace(/-/g, '');
+      const mk = (type, data) => `data: ${JSON.stringify({ type, ...data, id: rid })}\n\n`;
+      // response.created
+      res.write(mk('response.created', { response: { id: rid, object: 'response', model: model || 'auto', status: 'in_progress' } }));
+      // 逐块输出
+      await callLangdock(messages, lm, true, (text) => {
+        res.write(mk('response.output_text.delta', { delta: text }));
+      });
+      // 结束
+      res.write(mk('response.output_text.done', { text: '' }));
+      res.write(mk('response.completed', { response: { id: rid, object: 'response', model: model || 'auto', status: 'completed' } }));
+      res.end();
+    } else {
+      const ld = await callLangdock(messages, lm);
+      const text = extractText(ld);
+      res.json({
+        id: 'resp_' + uuid().replace(/-/g, ''),
+        object: 'response',
+        created_at: Math.floor(Date.now() / 1000),
+        model: model || 'auto',
+        output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] }],
+        status: 'completed',
+      });
+    }
   } catch (e) {
-    res.status(502).json({ error: { message: e.message } });
+    log('error:', e.message);
+    if (!res.headersSent) res.status(502).json({ error: { message: e.message } });
+    else res.end();
   }
 });
 
