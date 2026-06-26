@@ -741,50 +741,22 @@ router.post('/v1/chat/completions', async (req, res) => {
 // Tool Calling 支持
 // ============================================================
 
-// 把 Anthropic tools 定义转成 prompt 指令
+// 把 Anthropic tools 定义转成 prompt 指令 (function_call 格式)
 function formatToolsForPrompt(tools) {
   if (!tools || !tools.length) return '';
-  let s = '';
-
-  // 工具定义
-  s += '<available_tools>\n';
+  let s = '\n\nYou are a JSON API server. When the user requests a function call, respond with a JSON object in this EXACT format:\n\n';
+  s += '{"function_call":{"name":"TOOL_NAME","arguments":{"param":"value"}}}\n\n';
+  s += 'Function definitions:\n';
   for (const t of tools) {
     const schema = t.input_schema || t.inputSchema || {};
     const props = schema.properties || {};
     const req = schema.required || [];
-    s += `<tool name="${t.name}">\n`;
-    s += `  <description>${t.description || ''}</description>\n`;
-    if (Object.keys(props).length > 0) {
-      s += '  <parameters>\n';
-      for (const [k, v] of Object.entries(props)) {
-        s += `    <param name="${k}" type="${v.type || 'string'}" required="${req.includes(k)}" description="${v.description || ''}" />\n`;
-      }
-      s += '  </parameters>\n';
-    }
-    s += '</tool>\n';
+    s += `- ${t.name}(${Object.keys(props).map(k => k + (req.includes(k) ? '*' : '')).join(', ')}): ${t.description || ''}\n`;
   }
-  s += '</available_tools>\n\n';
-
-  // 调用指令
-  s += `<tool_calling_instructions>
-When you need to use a tool to answer the user's request, output the tool call in this EXACT format:
-
-<tool_call>
-{"name": "TOOL_NAME", "arguments": {"param": "value"}}
-</tool_call>
-
-Rules:
-1. You MUST use tools when asked to read files, write files, execute commands, search, etc.
-2. Output ONLY the <tool_call> block - no other text before or after
-3. Wait for the tool result before continuing
-4. NEVER make up file contents or command outputs
-
-Example - user asks "read /tmp/hello.txt":
-<tool_call>
-{"name": "Read", "arguments": {"file_path": "/tmp/hello.txt"}}
-</tool_call>
-</tool_calling_instructions>\n\n`;
-
+  s += '\nRules:\n';
+  s += '1. When a tool is needed, respond with ONLY the JSON function_call object\n';
+  s += '2. No explanation before or after the function_call\n';
+  s += '3. Output valid JSON only\n';
   return s;
 }
 
@@ -799,36 +771,65 @@ function toToolUseBlocks(calls) {
 }
 
 // 从文本解析工具调用
+// 支持两种格式:
+//   1. function_call JSON: {"function_call":{"name":"Read","arguments":{...}}}
+//   2. <tool_call> XML 标签 (备用)
 function parseToolCalls(text) {
   const calls = [];
-  // 匹配 <tool_call>...</tool_call>, 里面的 JSON 可能有换行
-  const re = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
-  let m;
-  while ((m = re.exec(text))) {
-    const jsonStr = m[1].trim();
-    try {
-      const obj = JSON.parse(jsonStr);
-      if (obj.name) calls.push({ name: obj.name, arguments: obj.arguments || obj.input || {} });
-    } catch {
-      // 尝试从代码块里提取 JSON
-      const codeBlock = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
-      if (codeBlock) {
-        try {
-          const obj = JSON.parse(codeBlock[1].trim());
-          if (obj.name) calls.push({ name: obj.name, arguments: obj.arguments || obj.input || {} });
-        } catch {}
-      }
-      // 尝试宽松匹配第一个 {...}
-      const jsonMatch = jsonStr.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        try {
-          const obj = JSON.parse(jsonMatch[0]);
-          if (obj.name) calls.push({ name: obj.name, arguments: obj.arguments || obj.input || {} });
-        } catch {}
+
+  // 1. 从代码块里提取 function_call JSON
+  const codeBlocks = text.match(/```(?:json)?\s*([\s\S]*?)```/g) || [];
+  for (const block of codeBlocks) {
+    const inner = block.replace(/```(?:json)?\s*/, '').replace(/```/, '').trim();
+    const fc = extractFunctionCall(inner);
+    if (fc) calls.push(fc);
+  }
+
+  // 2. 从纯文本里提取 function_call JSON
+  // 2. 尝试把整个文本当 JSON 解析 (模型直接输出 function_call JSON 的情况)
+  const wholeFc = extractFunctionCall(text.trim());
+  if (wholeFc && !calls.find(c => c.name === wholeFc.name)) calls.push(wholeFc);
+
+  // 3. 用括号匹配找 function_call JSON (处理嵌套对象)
+  const startIdx = text.indexOf('{"function_call"');
+  if (startIdx >= 0) {
+    let depth = 0;
+    for (let i = startIdx; i < text.length; i++) {
+      if (text[i] === '{') depth++;
+      else if (text[i] === '}') {
+        depth--;
+        if (depth === 0) {
+          const fc2 = extractFunctionCall(text.slice(startIdx, i + 1));
+          if (fc2 && !calls.find(c => c.name === fc2.name)) calls.push(fc2);
+          break;
+        }
       }
     }
   }
+
+  // 3. <tool_call> XML 标签 (备用)
+  const re = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
+  let m;
+  while ((m = re.exec(text))) {
+    try {
+      const obj = JSON.parse(m[1].trim());
+      if (obj.name && !calls.find(c => c.name === obj.name)) {
+        calls.push({ name: obj.name, arguments: obj.arguments || obj.input || {} });
+      }
+    } catch {}
+  }
+
   return calls;
+}
+
+function extractFunctionCall(str) {
+  try {
+    const obj = JSON.parse(str);
+    if (obj.function_call && obj.function_call.name) {
+      return { name: obj.function_call.name, arguments: obj.function_call.arguments || {} };
+    }
+  } catch {}
+  return null;
 }
 
 // 把 tool_result 转成文本注入消息
