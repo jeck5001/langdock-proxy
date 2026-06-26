@@ -716,61 +716,64 @@ router.post('/v1/chat/completions', async (req, res) => {
     logEntry.modelId = lm.id;
 
     // 构造消息: 如有工具则注入 system prompt
-    let msgs = messages.map(m => ({ role: m.role, content: m.content || '' }));
+    let msgs = messages.map(m => {
+      // 处理 tool result 消息 (Codex/Claude Code 执行完工具后发回的结果)
+      if (m.role === 'tool' || m.role === 'function') {
+        const name = m.name || m.tool_call_id || 'unknown';
+        const content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+        return { role: 'user', content: '[Tool result for ' + name + ']:\n' + content };
+      }
+      return { role: m.role, content: m.content || '' };
+    });
     if (hasTools) {
       const toolPrompt = formatToolsForPromptOpenAI(tools);
       msgs.unshift({ role: 'system', content: toolPrompt });
     }
 
-    // 服务端 Agent 循环: 当有 tools 时, 在 NAS 上执行工具, 循环直到模型给出最终答案
-    const MAX_TURNS = 10;
-    let finalText = '';
-    let toolCallsLog = [];
+    const ld = await callLangdockWithRetry(msgs, lm);
+    const text = extractText(ld);
+    logEntry.duration = Date.now() - startTime;
 
-    for (let turn = 0; turn < MAX_TURNS; turn++) {
-      const ld = await callLangdockWithRetry(msgs, lm);
-      const text = extractText(ld);
-
-      if (ld.status >= 400) {
-        logEntry.status = 'error';
-        logEntry.error = 'Langdock: ' + ld.body.slice(0, 200);
-        addCallLog(logEntry);
-        return res.status(ld.status).json({ error: { message: 'Langdock: ' + ld.body.slice(0, 500) } });
-      }
-
-      // 检测工具调用
-      if (hasTools) {
-        const calls = parseToolCalls(text);
-        if (calls.length > 0) {
-          // 执行每个工具调用
-          for (const c of calls) {
-            log(`[agent] 执行工具: ${c.name}(${JSON.stringify(c.arguments).slice(0, 100)})`);
-            const result = executeTool(c.name, c.arguments);
-            toolCallsLog.push({ name: c.name, args: c.arguments, result });
-
-            // 把工具结果追加到对话
-            msgs.push({ role: 'assistant', content: '<tool_call>\n' + JSON.stringify({name: c.name, arguments: c.arguments}) + '\n</tool_call>' });
-            msgs.push({ role: 'user', content: '[Tool result for ' + c.name + ']\n' + JSON.stringify(result) });
-          }
-          log(`[agent] turn ${turn + 1}: 执行了 ${calls.length} 个工具, 继续对话...`);
-          continue; // 继续循环, 让模型处理工具结果
-        }
-      }
-
-      // 没有工具调用 → 这是最终答案
-      finalText = text;
-      break;
+    if (ld.status >= 400) {
+      logEntry.status = 'error';
+      logEntry.error = 'Langdock: ' + ld.body.slice(0, 200);
+      addCallLog(logEntry);
+      return res.status(ld.status).json({ error: { message: 'Langdock: ' + ld.body.slice(0, 500) } });
     }
 
+    // 检测工具调用 → 返回给客户端在本地执行
+    if (hasTools) {
+      const calls = parseToolCalls(text);
+      if (calls.length > 0) {
+        const toolCalls = toOpenAIToolCalls(calls);
+        logEntry.status = 'success';
+        logEntry.duration = Date.now() - startTime;
+        logEntry.outputText = '(tool_call: ' + calls.map(c => c.name).join(', ') + ')';
+        logEntry.responsePreview = logEntry.outputText;
+        addCallLog(logEntry);
+        log(`[bridge] 返回 tool_calls: ${calls.map(c => c.name).join(', ')}`);
+        return res.json({
+          id: 'chatcmpl-' + uuid().replace(/-/g, '').slice(0, 24),
+          object: 'chat.completion',
+          created: Math.floor(Date.now() / 1000),
+          model: model || 'auto',
+          choices: [{
+            index: 0,
+            message: { role: 'assistant', content: null, tool_calls: toolCalls },
+            finish_reason: 'tool_calls',
+          }],
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        });
+      }
+    }
+
+    // 普通文本回复
     logEntry.status = 'success';
     logEntry.duration = Date.now() - startTime;
-    logEntry.outputText = finalText;
-    logEntry.responsePreview = finalText.slice(0, 200);
-    if (toolCallsLog.length > 0) {
-      logEntry.toolCalls = toolCallsLog.map(t => t.name).join(', ');
-    }
+    logEntry.outputText = text;
+    logEntry.responsePreview = text.slice(0, 200);
     addCallLog(logEntry);
-    res.json(toOpenAIResponse(finalText, model));
+    res.json(toOpenAIResponse(text, model));
 
     addCallLog(logEntry);
     addConversation({
