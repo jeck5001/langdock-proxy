@@ -737,6 +737,78 @@ router.post('/v1/chat/completions', async (req, res) => {
   }
 });
 
+// ============================================================
+// Tool Calling 支持
+// ============================================================
+
+// 把 Anthropic tools 定义转成 prompt 指令
+function formatToolsForPrompt(tools) {
+  if (!tools || !tools.length) return '';
+  let s = '\n\n--- AVAILABLE TOOLS ---\n';
+  s += 'When you need to use a tool, output EXACTLY this format (and nothing else for the tool call):\n\n';
+  s += '<tool_call>\n{"name":"ToolName","arguments":{"key":"value"}}\n</tool_call>\n\n';
+  s += 'Tools:\n\n';
+  for (const t of tools) {
+    s += '### ' + t.name + '\n' + (t.description || '') + '\n';
+    const schema = t.input_schema || t.inputSchema || {};
+    const props = schema.properties || {};
+    const req = schema.required || [];
+    for (const [k, v] of Object.entries(props)) {
+      s += '  - ' + k + (req.includes(k) ? '*' : '') + ': ' + (v.description || v.type || '');
+    }
+    s += '\n\n';
+  }
+  s += '---\n';
+  return s;
+}
+
+// 把工具调用转成 Anthropic tool_use content blocks
+function toToolUseBlocks(calls) {
+  return calls.map(c => ({
+    type: 'tool_use',
+    id: 'toolu_' + uuid().replace(/-/g, '').slice(0, 24),
+    name: c.name,
+    input: c.arguments,
+  }));
+}
+
+// 从文本解析工具调用
+function parseToolCalls(text) {
+  const calls = [];
+  const re = /<tool_call>([\s\S]*?)<\/tool_call>/g;
+  let m;
+  while ((m = re.exec(text))) {
+    try {
+      const obj = JSON.parse(m[1].trim());
+      if (obj.name) calls.push({ name: obj.name, arguments: obj.arguments || {} });
+    } catch {}
+  }
+  return calls;
+}
+
+// 把 tool_result 转成文本注入消息
+function convertToolMessages(messages) {
+  return messages.map(m => {
+    if (m.type === 'tool_result') {
+      let txt = typeof m.content === 'string' ? m.content :
+        (Array.isArray(m.content) ? m.content.filter(c=>c.type==='text').map(c=>c.text).join('') : JSON.stringify(m.content));
+      return { role: 'user', content: '[tool_result id=' + (m.tool_use_id||'') + ']\n' + txt };
+    }
+    if (m.type === 'tool_use') {
+      return { role: 'assistant', content: '<tool_call>\n' + JSON.stringify({name:m.name,arguments:m.input}) + '\n</tool_call>' };
+    }
+    let c = m.content;
+    if (Array.isArray(c)) {
+      const texts = c.filter(x => x.type === 'text').map(x => x.text);
+      const tools = c.filter(x => x.type === 'tool_use');
+      let result = texts.join('');
+      for (const t of tools) result += '\n<tool_call>\n' + JSON.stringify({name:t.name,arguments:t.input}) + '\n</tool_call>';
+      return { role: m.role, content: result };
+    }
+    return { role: m.role, content: c };
+  });
+}
+
 // ---------- Anthropic Messages ----------
 router.post('/v1/messages', async (req, res) => {
   const clientIp = req.ip || req.connection?.remoteAddress || 'unknown';
@@ -745,16 +817,29 @@ router.post('/v1/messages', async (req, res) => {
     return res.status(429).json({ error: { message: '请求过于频繁', type: 'rate_limit' } });
   }
 
-  const { messages, model, system, stream } = req.body || {};
+  const { messages, model, system, stream, tools, max_tokens } = req.body || {};
   if (!messages) return res.status(400).json({ error: { type: 'invalid_request_error', message: 'messages required' } });
 
   const startTime = Date.now();
-  let msgs = (messages || []).map(m => {
+  const hasTools = tools && tools.length > 0;
+
+  // 转换消息: 处理 tool_use / tool_result 内容块
+  let msgs = convertToolMessages(messages).map(m => {
     let c = m.content;
-    if (Array.isArray(c)) c = c.filter(x => x.type === 'text').map(x => x.text).join('');
+    if (typeof c !== 'string') c = typeof c === 'object' ? JSON.stringify(c) : String(c || '');
     return { role: m.role, content: c };
   });
-  if (system) msgs.unshift({ role: 'system', content: typeof system === 'string' ? system : JSON.stringify(system) });
+
+  // 构造 system prompt: 原始 system + 工具描述
+  let systemPrompt = '';
+  if (system) {
+    systemPrompt = typeof system === 'string' ? system :
+      (Array.isArray(system) ? system.map(s => s.text || s.content || '').join('\n') : JSON.stringify(system));
+  }
+  if (hasTools) {
+    systemPrompt += formatToolsForPrompt(tools);
+  }
+  if (systemPrompt) msgs.unshift({ role: 'system', content: systemPrompt });
 
   const logEntry = {
     endpoint: '/v1/messages',
@@ -763,6 +848,7 @@ router.post('/v1/messages', async (req, res) => {
     stream: !!stream,
     status: 'pending',
     duration: 0,
+    hasTools: hasTools,
     inputText: msgs.map(m => m.content || '').join('\n'),
   };
 
@@ -771,30 +857,8 @@ router.post('/v1/messages', async (req, res) => {
     logEntry.model = lm.displayName || lm.providerModelId || model;
     logEntry.modelId = lm.id;
 
-    if (stream) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      const msgId = 'msg_' + uuid().replace(/-/g, '');
-      const ev = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-      ev('message_start', { type: 'message_start', message: { id: msgId, type: 'message', role: 'assistant', content: [], model: model || 'auto', stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 } } });
-      ev('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
-
-      const outputChunks = [];
-      await callLangdockWithRetry(msgs, lm, true, (text) => {
-        outputChunks.push(text);
-        ev('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } });
-      });
-
-      ev('content_block_stop', { type: 'content_block_stop', index: 0 });
-      ev('message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 0 } });
-      ev('message_stop', { type: 'message_stop' });
-      res.end();
-
-      logEntry.status = 'success';
-      logEntry.duration = Date.now() - startTime;
-      logEntry.outputText = outputChunks.join('');
-      logEntry.responsePreview = logEntry.outputText.slice(0, 200);
-    } else {
+    // 非流式 (包括 tool calling)
+    if (!stream) {
       const ld = await callLangdockWithRetry(msgs, lm);
       const text = extractText(ld);
       logEntry.duration = Date.now() - startTime;
@@ -806,20 +870,81 @@ router.post('/v1/messages', async (req, res) => {
         return res.status(ld.status).json({ error: { message: 'Langdock: ' + ld.body.slice(0, 500), type: 'upstream_error' } });
       }
 
+      // 检测工具调用
+      if (hasTools) {
+        const calls = parseToolCalls(text);
+        if (calls.length > 0) {
+          const toolBlocks = toToolUseBlocks(calls);
+          // 分离: <tool_call> 前的文本 + tool_use 块
+          const beforeTool = text.split('<tool_call>')[0].trim();
+          const content = [];
+          if (beforeTool) content.push({ type: 'text', text: beforeTool });
+          content.push(...toolBlocks);
+
+          logEntry.status = 'success';
+          logEntry.outputText = '(tool_call: ' + calls.map(c => c.name).join(', ') + ')';
+          logEntry.responsePreview = logEntry.outputText;
+          addCallLog(logEntry);
+
+          return res.json({
+            id: 'msg_' + uuid().replace(/-/g, ''),
+            type: 'message', role: 'assistant',
+            model: model || 'auto',
+            content,
+            stop_reason: 'tool_use',
+            usage: { input_tokens: 0, output_tokens: 0 },
+          });
+        }
+      }
+
+      // 普通文本回复
       logEntry.status = 'success';
       logEntry.outputText = text;
       logEntry.responsePreview = text.slice(0, 200);
-      res.json(toClaudeResponse(text, model));
+      addCallLog(logEntry);
+      return res.json(toClaudeResponse(text, model));
     }
 
-    addCallLog(logEntry);
-    addConversation({
-      title: msgs[msgs.length - 1]?.content?.slice(0, 50) || '新对话',
-      model: logEntry.model,
-      messages: msgs,
-      response: logEntry.outputText || '',
-      endpoint: 'messages',
+    // 流式模式
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    const msgId = 'msg_' + uuid().replace(/-/g, '');
+    const ev = (event, data) => res.write('event: ' + event + '\ndata: ' + JSON.stringify(data) + '\n\n');
+
+    ev('message_start', { type: 'message_start', message: { id: msgId, type: 'message', role: 'assistant', content: [], model: model || 'auto', stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 } } });
+    ev('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+
+    const outputChunks = [];
+    await callLangdockWithRetry(msgs, lm, true, (text) => {
+      outputChunks.push(text);
+      ev('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } });
     });
+
+    ev('content_block_stop', { type: 'content_block_stop', index: 0 });
+
+    const fullText = outputChunks.join('');
+    // 流式模式下也检测工具调用
+    if (hasTools) {
+      const calls = parseToolCalls(fullText);
+      if (calls.length > 0) {
+        for (const c of calls) {
+          const blockIndex = 1; // 简化: 只支持 1 个工具调用
+          ev('content_block_start', { type: 'content_block_start', index: blockIndex, content_block: { type: 'tool_use', id: 'toolu_' + uuid().replace(/-/g,'').slice(0,24), name: c.name, input: {} } });
+          ev('content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'input_json_delta', partial_json: JSON.stringify(c.arguments) } });
+          ev('content_block_stop', { type: 'content_block_stop', index: blockIndex });
+        }
+      }
+    }
+
+    ev('message_delta', { type: 'message_delta', delta: { stop_reason: hasTools && parseToolCalls(fullText).length > 0 ? 'tool_use' : 'end_turn' }, usage: { output_tokens: 0 } });
+    ev('message_stop', { type: 'message_stop' });
+    res.end();
+
+    logEntry.status = 'success';
+    logEntry.duration = Date.now() - startTime;
+    logEntry.outputText = fullText;
+    logEntry.responsePreview = fullText.slice(0, 200);
+    addCallLog(logEntry);
 
   } catch (e) {
     log('error:', e.message);
