@@ -25,8 +25,48 @@ const { URL } = require('url');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { execSync } = require('child_process');
 
 function uuid() { return crypto.randomUUID(); }
+
+// ============================================================
+// 工具执行器 (在 NAS 上执行文件操作和命令)
+// ============================================================
+const WORKSPACE = process.env.WORKSPACE || '/workspace';
+
+function executeTool(name, args) {
+  try {
+    switch (name) {
+      case 'Read': {
+        const fp = path.resolve(WORKSPACE, args.file_path || args.path || '');
+        if (!fs.existsSync(fp)) return { error: `File not found: ${fp}` };
+        const content = fs.readFileSync(fp, 'utf8');
+        return { content };
+      }
+      case 'Write': {
+        const fp = path.resolve(WORKSPACE, args.file_path || args.path || '');
+        fs.mkdirSync(path.dirname(fp), { recursive: true });
+        fs.writeFileSync(fp, args.content || '');
+        return { ok: true, path: fp };
+      }
+      case 'Bash': {
+        const cmd = args.command || args.cmd || '';
+        const out = execSync(cmd, { cwd: WORKSPACE, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
+        return { output: out };
+      }
+      case 'Glob': {
+        const pattern = args.pattern || args.glob || '**/*';
+        const { execSync: es } = require('child_process');
+        const out = es(`find ${WORKSPACE} -maxdepth 5 -name '${pattern.replace(/'/g, "")}' | head -200`, { encoding: 'utf8', timeout: 10000 });
+        return { files: out.trim().split('\n').filter(Boolean) };
+      }
+      default:
+        return { error: `Unknown tool: ${name}` };
+    }
+  } catch (e) {
+    return { error: e.message };
+  }
+}
 
 // ============================================================
 // 配置管理 (支持热更新)
@@ -679,74 +719,58 @@ router.post('/v1/chat/completions', async (req, res) => {
     let msgs = messages.map(m => ({ role: m.role, content: m.content || '' }));
     if (hasTools) {
       const toolPrompt = formatToolsForPromptOpenAI(tools);
-      // 作为 system 消息插入到最前面
       msgs.unshift({ role: 'system', content: toolPrompt });
     }
 
-    if (stream) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
-      const id = 'chatcmpl-' + uuid().replace(/-/g, '').slice(0, 24);
-      const created = Math.floor(Date.now() / 1000);
-      const mk = (delta, fr) => `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model: model || 'auto', choices: [{ index: 0, delta, finish_reason: fr }] })}\n\n`;
-      res.write(mk({ role: 'assistant' }, null));
+    // 服务端 Agent 循环: 当有 tools 时, 在 NAS 上执行工具, 循环直到模型给出最终答案
+    const MAX_TURNS = 10;
+    let finalText = '';
+    let toolCallsLog = [];
 
-      const outputChunks = [];
-      await callLangdockWithRetry(msgs, lm, true, (text) => {
-        outputChunks.push(text);
-        res.write(mk({ content: text }, null));
-      });
-
-      res.write(mk({}, 'stop'));
-      res.write('data: [DONE]\n\n');
-      res.end();
-
-      logEntry.status = 'success';
-      logEntry.duration = Date.now() - startTime;
-      logEntry.outputText = outputChunks.join('');
-      logEntry.responsePreview = logEntry.outputText.slice(0, 200);
-    } else {
+    for (let turn = 0; turn < MAX_TURNS; turn++) {
       const ld = await callLangdockWithRetry(msgs, lm);
       const text = extractText(ld);
-      logEntry.duration = Date.now() - startTime;
 
       if (ld.status >= 400) {
         logEntry.status = 'error';
         logEntry.error = 'Langdock: ' + ld.body.slice(0, 200);
-        sendWebhook('call_error', { model: logEntry.model, error: logEntry.error });
-        return res.status(ld.status).json({ error: { message: 'Langdock: ' + ld.body.slice(0, 500), type: 'upstream_error' } });
+        addCallLog(logEntry);
+        return res.status(ld.status).json({ error: { message: 'Langdock: ' + ld.body.slice(0, 500) } });
       }
 
       // 检测工具调用
       if (hasTools) {
         const calls = parseToolCalls(text);
         if (calls.length > 0) {
-          const toolCalls = toOpenAIToolCalls(calls);
-          logEntry.status = 'success';
-          logEntry.outputText = '(tool_call: ' + calls.map(c => c.name).join(', ') + ')';
-          logEntry.responsePreview = logEntry.outputText;
-          addCallLog(logEntry);
-          return res.json({
-            id: 'chatcmpl-' + uuid().replace(/-/g, '').slice(0, 24),
-            object: 'chat.completion',
-            created: Math.floor(Date.now() / 1000),
-            model: model || 'auto',
-            choices: [{
-              index: 0,
-              message: { role: 'assistant', content: null, tool_calls: toolCalls },
-              finish_reason: 'tool_calls',
-            }],
-            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-          });
+          // 执行每个工具调用
+          for (const c of calls) {
+            log(`[agent] 执行工具: ${c.name}(${JSON.stringify(c.arguments).slice(0, 100)})`);
+            const result = executeTool(c.name, c.arguments);
+            toolCallsLog.push({ name: c.name, args: c.arguments, result });
+
+            // 把工具结果追加到对话
+            msgs.push({ role: 'assistant', content: '<tool_call>\n' + JSON.stringify({name: c.name, arguments: c.arguments}) + '\n</tool_call>' });
+            msgs.push({ role: 'user', content: '[Tool result for ' + c.name + ']\n' + JSON.stringify(result) });
+          }
+          log(`[agent] turn ${turn + 1}: 执行了 ${calls.length} 个工具, 继续对话...`);
+          continue; // 继续循环, 让模型处理工具结果
         }
       }
 
-      logEntry.status = 'success';
-      logEntry.outputText = text;
-      logEntry.responsePreview = text.slice(0, 200);
-      res.json(toOpenAIResponse(text, model));
+      // 没有工具调用 → 这是最终答案
+      finalText = text;
+      break;
     }
+
+    logEntry.status = 'success';
+    logEntry.duration = Date.now() - startTime;
+    logEntry.outputText = finalText;
+    logEntry.responsePreview = finalText.slice(0, 200);
+    if (toolCallsLog.length > 0) {
+      logEntry.toolCalls = toolCallsLog.map(t => t.name).join(', ');
+    }
+    addCallLog(logEntry);
+    res.json(toOpenAIResponse(finalText, model));
 
     addCallLog(logEntry);
     addConversation({
@@ -960,47 +984,57 @@ router.post('/v1/messages', async (req, res) => {
     logEntry.model = lm.displayName || lm.providerModelId || model;
     logEntry.modelId = lm.id;
 
-    // 非流式 (包括 tool calling)
+    // 非流式 + 服务端 Agent 循环 (有工具时)
+    if (!stream && hasTools) {
+      const MAX_TURNS = 10;
+      for (let turn = 0; turn < MAX_TURNS; turn++) {
+        const ld = await callLangdockWithRetry(msgs, lm);
+        const text = extractText(ld);
+
+        if (ld.status >= 400) {
+          logEntry.status = 'error';
+          logEntry.error = 'Langdock: ' + ld.body.slice(0, 200);
+          addCallLog(logEntry);
+          return res.status(ld.status).json({ error: { message: 'Langdock: ' + ld.body.slice(0, 500), type: 'upstream_error' } });
+        }
+
+        const calls = parseToolCalls(text);
+        if (calls.length > 0) {
+          for (const c of calls) {
+            log(`[agent:claude] 执行工具: ${c.name}(${JSON.stringify(c.arguments).slice(0,100)})`);
+            const result = executeTool(c.name, c.arguments);
+            msgs.push({ role: 'assistant', content: '{"function_call":{"name":"' + c.name + '","arguments":' + JSON.stringify(c.arguments) + '}}' });
+            msgs.push({ role: 'user', content: '[tool_result]\n' + JSON.stringify(result) });
+          }
+          log(`[agent:claude] turn ${turn+1}: 执行了 ${calls.length} 个工具`);
+          continue;
+        }
+
+        // 最终答案
+        logEntry.status = 'success';
+        logEntry.duration = Date.now() - startTime;
+        logEntry.outputText = text;
+        logEntry.responsePreview = text.slice(0, 200);
+        addCallLog(logEntry);
+        return res.json(toClaudeResponse(text, model));
+      }
+      logEntry.status = 'error';
+      logEntry.error = 'agent loop exceeded max turns';
+      addCallLog(logEntry);
+      return res.status(500).json({ error: { message: 'Agent loop exceeded max turns' } });
+    }
+
+    // 非流式无工具: 直接返回
     if (!stream) {
       const ld = await callLangdockWithRetry(msgs, lm);
       const text = extractText(ld);
       logEntry.duration = Date.now() - startTime;
-
       if (ld.status >= 400) {
         logEntry.status = 'error';
         logEntry.error = 'Langdock: ' + ld.body.slice(0, 200);
         addCallLog(logEntry);
         return res.status(ld.status).json({ error: { message: 'Langdock: ' + ld.body.slice(0, 500), type: 'upstream_error' } });
       }
-
-      // 检测工具调用
-      if (hasTools) {
-        const calls = parseToolCalls(text);
-        if (calls.length > 0) {
-          const toolBlocks = toToolUseBlocks(calls);
-          // 分离: <tool_call> 前的文本 + tool_use 块
-          const beforeTool = text.split('<tool_call>')[0].trim();
-          const content = [];
-          if (beforeTool) content.push({ type: 'text', text: beforeTool });
-          content.push(...toolBlocks);
-
-          logEntry.status = 'success';
-          logEntry.outputText = '(tool_call: ' + calls.map(c => c.name).join(', ') + ')';
-          logEntry.responsePreview = logEntry.outputText;
-          addCallLog(logEntry);
-
-          return res.json({
-            id: 'msg_' + uuid().replace(/-/g, ''),
-            type: 'message', role: 'assistant',
-            model: model || 'auto',
-            content,
-            stop_reason: 'tool_use',
-            usage: { input_tokens: 0, output_tokens: 0 },
-          });
-        }
-      }
-
-      // 普通文本回复
       logEntry.status = 'success';
       logEntry.outputText = text;
       logEntry.responsePreview = text.slice(0, 200);
@@ -1135,53 +1169,54 @@ router.post('/v1/responses', async (req, res) => {
       logEntry.outputText = outputChunks.join('');
       logEntry.responsePreview = logEntry.outputText.slice(0, 200);
     } else {
-      const ld = await callLangdockWithRetry(messages, lm);
-      const text = extractText(ld);
-      logEntry.duration = Date.now() - startTime;
+      // 非流式: 服务端 Agent 循环 (Codex)
+      const MAX_TURNS = 10;
+      for (let turn = 0; turn < MAX_TURNS; turn++) {
+        const ld = await callLangdockWithRetry(messages, lm);
+        const text = extractText(ld);
+        logEntry.duration = Date.now() - startTime;
 
-      if (ld.status >= 400) {
-        logEntry.status = 'error';
-        logEntry.error = 'Langdock: ' + ld.body.slice(0, 200);
-        addCallLog(logEntry);
-        return res.status(ld.status).json({ error: { message: 'Langdock: ' + ld.body.slice(0, 500), type: 'upstream_error' } });
-      }
-
-      // 检测工具调用
-      if (hasTools) {
-        const calls = parseToolCalls(text);
-        if (calls.length > 0) {
-          const toolCalls = toOpenAIToolCalls(calls);
-          logEntry.status = 'success';
-          logEntry.outputText = '(tool_call: ' + calls.map(c => c.name).join(', ') + ')';
+        if (ld.status >= 400) {
+          logEntry.status = 'error';
+          logEntry.error = 'Langdock: ' + ld.body.slice(0, 200);
           addCallLog(logEntry);
-          return res.json({
-            id: 'resp_' + uuid().replace(/-/g, ''),
-            object: 'response',
-            created_at: Math.floor(Date.now() / 1000),
-            model: model || 'auto',
-            output: [{
-              type: 'function_call',
-              id: toolCalls[0].id,
-              call_id: toolCalls[0].id,
-              name: toolCalls[0].function.name,
-              arguments: toolCalls[0].function.arguments,
-            }],
-            status: 'completed',
-          });
+          return res.status(ld.status).json({ error: { message: 'Langdock: ' + ld.body.slice(0, 500), type: 'upstream_error' } });
         }
-      }
 
-      logEntry.status = 'success';
-      logEntry.outputText = text;
-      logEntry.responsePreview = text.slice(0, 200);
-      res.json({
-        id: 'resp_' + uuid().replace(/-/g, ''),
-        object: 'response',
-        created_at: Math.floor(Date.now() / 1000),
-        model: model || 'auto',
-        output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] }],
-        status: 'completed',
-      });
+        if (hasTools) {
+          const calls = parseToolCalls(text);
+          if (calls.length > 0) {
+            for (const c of calls) {
+              log(`[agent:codex] 执行工具: ${c.name}(${JSON.stringify(c.arguments).slice(0,100)})`);
+              const result = executeTool(c.name, c.arguments);
+              messages.push({ role: 'assistant', content: '{"function_call":{"name":"' + c.name + '","arguments":' + JSON.stringify(c.arguments) + '}}' });
+              messages.push({ role: 'user', content: '[tool_result]\n' + JSON.stringify(result) });
+            }
+            log(`[agent:codex] turn ${turn+1}: 执行了 ${calls.length} 个工具`);
+            continue;
+          }
+        }
+
+        // 最终答案
+        logEntry.status = 'success';
+        logEntry.outputText = text;
+        logEntry.responsePreview = text.slice(0, 200);
+        addCallLog(logEntry);
+        addConversation({ title: messages[messages.length - 1]?.content?.slice(0, 50) || '新对话', model: logEntry.model, messages, response: text, endpoint: 'responses' });
+        return res.json({
+          id: 'resp_' + uuid().replace(/-/g, ''),
+          object: 'response',
+          created_at: Math.floor(Date.now() / 1000),
+          model: model || 'auto',
+          output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] }],
+          status: 'completed',
+        });
+      }
+      // 超出上限
+      logEntry.status = 'error';
+      logEntry.error = 'agent loop exceeded max turns';
+      addCallLog(logEntry);
+      return res.status(500).json({ error: { message: 'Agent loop exceeded max turns' } });
     }
 
     addCallLog(logEntry);
