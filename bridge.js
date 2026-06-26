@@ -652,9 +652,10 @@ router.post('/v1/chat/completions', async (req, res) => {
     });
   }
 
-  const { messages, model, stream } = req.body || {};
+  const { messages, model, stream, tools, tool_choice } = req.body || {};
   if (!messages) return res.status(400).json({ error: { message: 'messages required' } });
 
+  const hasTools = tools && tools.length > 0;
   const startTime = Date.now();
   const logEntry = {
     endpoint: '/v1/chat/completions',
@@ -665,6 +666,7 @@ router.post('/v1/chat/completions', async (req, res) => {
     duration: 0,
     responsePreview: '',
     error: null,
+    hasTools,
     inputText: messages.map(m => m.content || '').join('\n'),
   };
 
@@ -672,6 +674,14 @@ router.post('/v1/chat/completions', async (req, res) => {
     const lm = await resolveModel(model);
     logEntry.model = lm.displayName || lm.providerModelId || model;
     logEntry.modelId = lm.id;
+
+    // 构造消息: 如有工具则注入 system prompt
+    let msgs = messages.map(m => ({ role: m.role, content: m.content || '' }));
+    if (hasTools) {
+      const toolPrompt = formatToolsForPromptOpenAI(tools);
+      // 作为 system 消息插入到最前面
+      msgs.unshift({ role: 'system', content: toolPrompt });
+    }
 
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
@@ -683,7 +693,7 @@ router.post('/v1/chat/completions', async (req, res) => {
       res.write(mk({ role: 'assistant' }, null));
 
       const outputChunks = [];
-      await callLangdockWithRetry(messages, lm, true, (text) => {
+      await callLangdockWithRetry(msgs, lm, true, (text) => {
         outputChunks.push(text);
         res.write(mk({ content: text }, null));
       });
@@ -697,7 +707,7 @@ router.post('/v1/chat/completions', async (req, res) => {
       logEntry.outputText = outputChunks.join('');
       logEntry.responsePreview = logEntry.outputText.slice(0, 200);
     } else {
-      const ld = await callLangdockWithRetry(messages, lm);
+      const ld = await callLangdockWithRetry(msgs, lm);
       const text = extractText(ld);
       logEntry.duration = Date.now() - startTime;
 
@@ -708,6 +718,30 @@ router.post('/v1/chat/completions', async (req, res) => {
         return res.status(ld.status).json({ error: { message: 'Langdock: ' + ld.body.slice(0, 500), type: 'upstream_error' } });
       }
 
+      // 检测工具调用
+      if (hasTools) {
+        const calls = parseToolCalls(text);
+        if (calls.length > 0) {
+          const toolCalls = toOpenAIToolCalls(calls);
+          logEntry.status = 'success';
+          logEntry.outputText = '(tool_call: ' + calls.map(c => c.name).join(', ') + ')';
+          logEntry.responsePreview = logEntry.outputText;
+          addCallLog(logEntry);
+          return res.json({
+            id: 'chatcmpl-' + uuid().replace(/-/g, '').slice(0, 24),
+            object: 'chat.completion',
+            created: Math.floor(Date.now() / 1000),
+            model: model || 'auto',
+            choices: [{
+              index: 0,
+              message: { role: 'assistant', content: null, tool_calls: toolCalls },
+              finish_reason: 'tool_calls',
+            }],
+            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+          });
+        }
+      }
+
       logEntry.status = 'success';
       logEntry.outputText = text;
       logEntry.responsePreview = text.slice(0, 200);
@@ -715,8 +749,6 @@ router.post('/v1/chat/completions', async (req, res) => {
     }
 
     addCallLog(logEntry);
-
-    // 保存对话历史
     addConversation({
       title: messages[messages.length - 1]?.content?.slice(0, 50) || '新对话',
       model: logEntry.model,
@@ -853,6 +885,31 @@ function convertToolMessages(messages) {
     }
     return { role: m.role, content: c };
   });
+}
+
+// OpenAI 格式: 工具调用 prompt 注入
+function formatToolsForPromptOpenAI(tools) {
+  if (!tools || !tools.length) return '';
+  let s = '\n\nYou are a JSON API server. When the user requests a function call, respond with the function call in JSON format.\n\n';
+  s += 'Function definitions:\n';
+  for (const t of tools) {
+    const schema = t.parameters || t.input_schema || {};
+    const props = schema.properties || {};
+    const req = schema.required || [];
+    s += `- ${t.name}(${Object.keys(props).map(k => k + (req.includes(k) ? '*' : '')).join(', ')}): ${t.description || ''}\n`;
+  }
+  s += '\nTo call a function, respond with ONLY this JSON (no explanation):\n';
+  s += '{"function_call":{"name":"TOOL_NAME","arguments":{"param":"value"}}}\n';
+  return s;
+}
+
+// 把 function_call 解析结果转成 OpenAI tool_calls 格式
+function toOpenAIToolCalls(calls) {
+  return calls.map(c => ({
+    id: 'call_' + uuid().replace(/-/g, '').slice(0, 24),
+    type: 'function',
+    function: { name: c.name, arguments: JSON.stringify(c.arguments) },
+  }));
 }
 
 // ---------- Anthropic Messages ----------
@@ -1011,7 +1068,7 @@ router.post('/v1/responses', async (req, res) => {
     return res.status(429).json({ error: { message: '请求过于频繁', type: 'rate_limit' } });
   }
 
-  const { input, model, stream } = req.body || {};
+  const { input, model, stream, tools } = req.body || {};
   let messages = [];
   if (typeof input === 'string') messages = [{ role: 'user', content: input }];
   else if (Array.isArray(input)) messages = input.map(m => {
@@ -1021,6 +1078,14 @@ router.post('/v1/responses', async (req, res) => {
   });
   if (!messages.length) return res.status(400).json({ error: { message: 'input required' } });
 
+  const hasTools = tools && tools.length > 0;
+
+  // 注入工具 prompt
+  if (hasTools) {
+    const toolPrompt = formatToolsForPromptOpenAI(tools);
+    messages.unshift({ role: 'system', content: toolPrompt });
+  }
+
   const startTime = Date.now();
   const logEntry = {
     endpoint: '/v1/responses',
@@ -1029,6 +1094,7 @@ router.post('/v1/responses', async (req, res) => {
     stream: !!stream,
     status: 'pending',
     duration: 0,
+    hasTools,
     inputText: messages.map(m => m.content || '').join('\n'),
   };
 
@@ -1069,6 +1135,31 @@ router.post('/v1/responses', async (req, res) => {
         logEntry.error = 'Langdock: ' + ld.body.slice(0, 200);
         addCallLog(logEntry);
         return res.status(ld.status).json({ error: { message: 'Langdock: ' + ld.body.slice(0, 500), type: 'upstream_error' } });
+      }
+
+      // 检测工具调用
+      if (hasTools) {
+        const calls = parseToolCalls(text);
+        if (calls.length > 0) {
+          const toolCalls = toOpenAIToolCalls(calls);
+          logEntry.status = 'success';
+          logEntry.outputText = '(tool_call: ' + calls.map(c => c.name).join(', ') + ')';
+          addCallLog(logEntry);
+          return res.json({
+            id: 'resp_' + uuid().replace(/-/g, ''),
+            object: 'response',
+            created_at: Math.floor(Date.now() / 1000),
+            model: model || 'auto',
+            output: [{
+              type: 'function_call',
+              id: toolCalls[0].id,
+              call_id: toolCalls[0].id,
+              name: toolCalls[0].function.name,
+              arguments: toolCalls[0].function.arguments,
+            }],
+            status: 'completed',
+          });
+        }
       }
 
       logEntry.status = 'success';
