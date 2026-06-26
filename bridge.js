@@ -31,6 +31,9 @@ function uuid() { return crypto.randomUUID(); }
 
 // ============================================================
 // 工具执行器 (在 NAS 上执行文件操作和命令)
+// 用于 Codex/Claude Code 的自动预执行:
+// bridge 检测到用户请求需要文件/命令操作时, 自动在 NAS 上执行,
+// 把结果拼到消息里发给 Langdock, 让模型基于真实数据回答
 // ============================================================
 const WORKSPACE = process.env.WORKSPACE || '/workspace';
 
@@ -40,8 +43,9 @@ function executeTool(name, args) {
       case 'Read': {
         const fp = path.resolve(WORKSPACE, args.file_path || args.path || '');
         if (!fs.existsSync(fp)) return { error: `File not found: ${fp}` };
-        const content = fs.readFileSync(fp, 'utf8');
-        return { content };
+        const stat = fs.statSync(fp);
+        if (stat.size > 100000) return { content: fs.readFileSync(fp, 'utf8').slice(0, 100000) + '\n... (truncated, file too large)' };
+        return { content: fs.readFileSync(fp, 'utf8') };
       }
       case 'Write': {
         const fp = path.resolve(WORKSPACE, args.file_path || args.path || '');
@@ -51,14 +55,21 @@ function executeTool(name, args) {
       }
       case 'Bash': {
         const cmd = args.command || args.cmd || '';
-        const out = execSync(cmd, { cwd: WORKSPACE, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
-        return { output: out };
+        try {
+          const out = execSync(cmd, { cwd: WORKSPACE, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
+          return { output: out };
+        } catch (e) {
+          return { output: e.stdout || '', error: e.stderr || e.message };
+        }
       }
       case 'Glob': {
         const pattern = args.pattern || args.glob || '**/*';
-        const { execSync: es } = require('child_process');
-        const out = es(`find ${WORKSPACE} -maxdepth 5 -name '${pattern.replace(/'/g, "")}' | head -200`, { encoding: 'utf8', timeout: 10000 });
-        return { files: out.trim().split('\n').filter(Boolean) };
+        try {
+          const out = execSync(`find ${WORKSPACE} -maxdepth 5 -name '${pattern.replace(/'/g, "")}' 2>/dev/null | head -200`, { encoding: 'utf8', timeout: 10000 });
+          return { files: out.trim().split('\n').filter(Boolean) };
+        } catch (e) {
+          return { files: [], error: e.message };
+        }
       }
       default:
         return { error: `Unknown tool: ${name}` };
@@ -66,6 +77,60 @@ function executeTool(name, args) {
   } catch (e) {
     return { error: e.message };
   }
+}
+
+// 自动预执行: 从用户消息中检测需要什么文件/命令, 自动获取
+function autoExecuteContext(userMessage, tools) {
+  const contextParts = [];
+  const toolNames = (tools || []).map(t => (t.function || t).name || t.name);
+
+  // 检测用户是否要求分析项目/目录/文件
+  const projectKeywords = ['分析', '项目', 'project', 'analyze', 'explain', 'codebase', '目录', '结构', 'structure', '文件', 'file', 'read', '查看', '看看', '列出', 'list', '当前', 'current'];
+  const needsProjectContext = projectKeywords.some(k => userMessage.toLowerCase().includes(k));
+
+  if (needsProjectContext || toolNames.includes('Bash')) {
+    // 自动获取项目结构
+    log('[auto] 预执行: 获取项目上下文');
+    const lsResult = executeTool('Bash', { command: 'ls -la' });
+    if (lsResult.output) contextParts.push('=== 项目根目录 ===\n' + lsResult.output);
+
+    const findResult = executeTool('Bash', { command: 'find . -maxdepth 4 -type f 2>/dev/null | grep -v "target/" | grep -v ".git/" | grep -v "node_modules/" | head -100' });
+    if (findResult.output) contextParts.push('=== 项目文件结构 ===\n' + findResult.output);
+
+    // 检测 pom.xml / build.gradle / package.json 等
+    const buildFiles = ['pom.xml', 'build.gradle', 'package.json', 'Cargo.toml', 'go.mod', 'requirements.txt', 'Makefile'];
+    for (const bf of buildFiles) {
+      const r = executeTool('Read', { file_path: bf });
+      if (r.content) contextParts.push(`=== ${bf} ===\n${r.content.slice(0, 5000)}`);
+    }
+
+    // 检测 README
+    const readmeResult = executeTool('Bash', { command: 'cat README.md README.txt 2>/dev/null | head -50' });
+    if (readmeResult.output) contextParts.push('=== README ===\n' + readmeResult.output);
+
+    // 检测主要源码目录
+    const srcResult = executeTool('Bash', { command: 'find src/main/java -maxdepth 5 -type d 2>/dev/null | sort | head -30; find src -maxdepth 3 -type f -name "*.py" -o -name "*.js" -o -name "*.ts" 2>/dev/null | head -30' });
+    if (srcResult.output) contextParts.push('=== 源码结构 ===\n' + srcResult.output);
+
+    // 检测配置文件
+    const configResult = executeTool('Bash', { command: 'cat src/main/resources/application.yml src/main/resources/application.properties .env config.yaml 2>/dev/null | head -100' });
+    if (configResult.output) contextParts.push('=== 配置文件 ===\n' + configResult.output);
+  }
+
+  // 检测用户是否提到读取特定文件
+  const fileMatch = userMessage.match(/(?:read|查看|看看|读取|打开)\s+([\/\w\-\.]+\.\w+)/i) ||
+                    userMessage.match(/([\/\w\-\.]+\.\w+)\s*(?:的内容|文件)/i);
+  if (fileMatch && toolNames.includes('Read')) {
+    const filePath = fileMatch[1];
+    const r = executeTool('Read', { file_path: filePath });
+    if (r.content) contextParts.push(`=== ${filePath} 内容 ===\n${r.content.slice(0, 5000)}`);
+  }
+
+  if (contextParts.length > 0) {
+    log(`[auto] 预执行获取了 ${contextParts.length} 个上下文块`);
+    return '\n\n[以下是你本地项目的真实数据, 基于这些数据回答用户的问题]\n\n' + contextParts.join('\n\n');
+  }
+  return '';
 }
 
 // ============================================================
@@ -1149,22 +1214,25 @@ router.post('/v1/responses', async (req, res) => {
 
   const hasTools = tools && tools.length > 0;
 
-  // 注入工具 prompt
+  // 有工具时: 自动预执行, 获取项目上下文拼到消息里
+  // 这样模型不需要做 tool calling, 直接基于真实数据回答
   if (hasTools) {
-    const toolPrompt = formatToolsForPromptOpenAI(tools);
-    messages.unshift({ role: 'system', content: toolPrompt });
+    const lastUserMsg = messages.filter(m => m.role === 'user').pop();
+    if (lastUserMsg) {
+      const autoContext = autoExecuteContext(lastUserMsg.content, tools);
+      if (autoContext) {
+        lastUserMsg.content += autoContext;
+        log('[bridge:codex] 已预执行工具获取上下文, 拼入消息');
+      }
+    }
   }
-
-  // 有工具时强制非流式: 需要解析完整响应中的 function_call
-  const forceNonStream = hasTools;
-  const useStream = stream && !forceNonStream;
 
   const startTime = Date.now();
   const logEntry = {
     endpoint: '/v1/responses',
     model: model || 'auto',
     messageCount: messages.length,
-    stream: !!useStream,
+    stream: !!stream,
     status: 'pending',
     duration: 0,
     hasTools,
@@ -1176,108 +1244,7 @@ router.post('/v1/responses', async (req, res) => {
     logEntry.model = lm.displayName || lm.providerModelId || model;
     logEntry.modelId = lm.id;
 
-    // 有工具时: 非流式调 Langdock, 解析完整文本中的 function_call,
-    // 然后通过 SSE 流返回给 Codex (因为 Codex 期望 SSE)
-    if (hasTools && stream) {
-      // 先非流式调 Langdock 拿完整响应
-      const ld = await callLangdockWithRetry(messages, lm);
-      const text = extractText(ld);
-      logEntry.duration = Date.now() - startTime;
-
-      if (ld.status >= 400) {
-        logEntry.status = 'error';
-        logEntry.error = 'Langdock: ' + ld.body.slice(0, 200);
-        addCallLog(logEntry);
-        // 错误也要通过 SSE 流返回
-        res.setHeader('Content-Type', 'text/event-stream');
-        res.setHeader('Cache-Control', 'no-cache');
-        const rid = 'resp_' + uuid().replace(/-/g, '');
-        const sse = (type, data) => { res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`); };
-        sse('response.created', { response: { id: rid, object: 'response', model: model || 'auto', status: 'in_progress', output: [] } });
-        sse('response.in_progress', { response: { id: rid, object: 'response', model: model || 'auto', status: 'in_progress' } });
-        const itemId = 'item_' + uuid().replace(/-/g, '').slice(0, 12);
-        sse('response.output_item.added', { output_index: 0, item: { id: itemId, type: 'message', role: 'assistant', status: 'in_progress', content: [] } });
-        sse('response.content_part.added', { output_index: 0, content_index: 0, part: { type: 'output_text', text: '' } });
-        sse('response.output_text.delta', { output_index: 0, content_index: 0, delta: 'Error: ' + ld.body.slice(0, 200) });
-        sse('response.content_part.done', { output_index: 0, content_index: 0, part: { type: 'output_text', text: 'Error' } });
-        sse('response.output_item.done', { output_index: 0, item: { id: itemId, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'Error' }] } });
-        sse('response.completed', { response: { id: rid, object: 'response', model: model || 'auto', status: 'completed', output: [{ id: itemId, type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Error' }] }] } });
-        res.end();
-        return;
-      }
-
-      // 检测 function_call
-      const calls = parseToolCalls(text);
-      const rid = 'resp_' + uuid().replace(/-/g, '');
-      const itemId = 'item_' + uuid().replace(/-/g, '').slice(0, 12);
-
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      const sse = (type, data) => { res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`); };
-
-      sse('response.created', { response: { id: rid, object: 'response', model: model || 'auto', status: 'in_progress', output: [] } });
-      sse('response.in_progress', { response: { id: rid, object: 'response', model: model || 'auto', status: 'in_progress' } });
-
-      if (calls.length > 0) {
-        // 有工具调用 → 通过 SSE 流返回 function_call 给 Codex
-        const toolCalls = toOpenAIToolCalls(calls);
-        log(`[bridge:codex] 返回 function_call via SSE: ${calls.map(c => c.name).join(', ')}`);
-
-        // 返回 function_call 输出项
-        sse('response.output_item.added', { output_index: 0, item: { id: itemId, type: 'function_call', name: calls[0].name, call_id: toolCalls[0].id, status: 'in_progress' } });
-        sse('response.function_call_arguments.delta', { output_index: 0, item_id: itemId, call_id: toolCalls[0].id, delta: toolCalls[0].function.arguments });
-        sse('response.function_call_arguments.done', { output_index: 0, item_id: itemId, call_id: toolCalls[0].id, arguments: toolCalls[0].function.arguments });
-
-        // 如果有多个工具调用
-        for (let i = 1; i < calls.length; i++) {
-          const tc = toolCalls[i];
-          const iid2 = 'item_' + uuid().replace(/-/g, '').slice(0, 12);
-          sse('response.output_item.added', { output_index: i, item: { id: iid2, type: 'function_call', name: calls[i].name, call_id: tc.id, status: 'in_progress' } });
-          sse('response.function_call_arguments.delta', { output_index: i, item_id: iid2, call_id: tc.id, delta: tc.function.arguments });
-          sse('response.function_call_arguments.done', { output_index: i, item_id: iid2, call_id: tc.id, arguments: tc.function.arguments });
-        }
-
-        const output = calls.map((c, i) => ({
-          id: itemId + (i > 0 ? '_' + i : ''),
-          type: 'function_call',
-          name: c.name,
-          call_id: toolCalls[i].id,
-          arguments: toolCalls[i].function.arguments,
-          status: 'completed',
-        }));
-
-        sse('response.completed', { response: { id: rid, object: 'response', model: model || 'auto', status: 'completed', output } });
-        res.end();
-
-        logEntry.status = 'success';
-        logEntry.outputText = '(function_call: ' + calls.map(c => c.name).join(', ') + ')';
-        logEntry.responsePreview = logEntry.outputText;
-        addCallLog(logEntry);
-      } else {
-        // 没有工具调用 → 普通文本, 通过 SSE 流返回
-        sse('response.output_item.added', { output_index: 0, item: { id: itemId, type: 'message', role: 'assistant', status: 'in_progress', content: [] } });
-        sse('response.content_part.added', { output_index: 0, content_index: 0, part: { type: 'output_text', text: '' } });
-        // 逐块发送文本 (模拟流式)
-        const chunks = text.match(/.{1,5}/g) || [text];
-        for (const chunk of chunks) {
-          sse('response.output_text.delta', { output_index: 0, content_index: 0, delta: chunk });
-        }
-        sse('response.content_part.done', { output_index: 0, content_index: 0, part: { type: 'output_text', text } });
-        sse('response.output_item.done', { output_index: 0, item: { id: itemId, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text }] } });
-        sse('response.completed', { response: { id: rid, object: 'response', model: model || 'auto', status: 'completed', output: [{ id: itemId, type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] }] } });
-        res.end();
-
-        logEntry.status = 'success';
-        logEntry.outputText = text;
-        logEntry.responsePreview = text.slice(0, 200);
-        addCallLog(logEntry);
-      }
-
-      addConversation({ title: messages[messages.length - 1]?.content?.slice(0, 50) || '新对话', model: logEntry.model, messages, response: logEntry.outputText, endpoint: 'responses' });
-      return;
-    }
-
-    // 普通流式 (无工具)
+    // 所有请求统一走流式 (Codex 期望 SSE)
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
