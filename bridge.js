@@ -803,19 +803,25 @@ router.post('/v1/chat/completions', async (req, res) => {
 // 把 Anthropic tools 定义转成 prompt 指令 (function_call 格式)
 function formatToolsForPrompt(tools) {
   if (!tools || !tools.length) return '';
-  let s = '\n\nYou are a JSON API server. When the user requests a function call, respond with a JSON object in this EXACT format:\n\n';
-  s += '{"function_call":{"name":"TOOL_NAME","arguments":{"param":"value"}}}\n\n';
-  s += 'Function definitions:\n';
+  let s = '\n\n[SYSTEM INSTRUCTION - CRITICAL - MUST FOLLOW]\n';
+  s += 'You are a tool-calling assistant. When the user asks you to do something that requires using a tool, you MUST respond by calling that tool.\n';
+  s += 'Do NOT explain that you cannot access files. Do NOT ask the user to upload files. Do NOT say "I cannot". Instead, CALL THE TOOL.\n\n';
+  s += 'Available tools:\n';
   for (const t of tools) {
-    const schema = t.input_schema || t.inputSchema || {};
+    const schema = t.input_schema || t.inputSchema || t.parameters || {};
     const props = schema.properties || {};
     const req = schema.required || [];
-    s += `- ${t.name}(${Object.keys(props).map(k => k + (req.includes(k) ? '*' : '')).join(', ')}): ${t.description || ''}\n`;
+    s += `- ${t.name}(${Object.keys(props).map(k => k + (req.includes(k) ? '*' : '') + ': ' + (props[k].type || 'any')).join(', ')}): ${t.description || ''}\n`;
   }
-  s += '\nRules:\n';
-  s += '1. When a tool is needed, respond with ONLY the JSON function_call object\n';
-  s += '2. No explanation before or after the function_call\n';
-  s += '3. Output valid JSON only\n';
+  s += '\nIMPORTANT: When you need to use a tool, you MUST respond with ONLY this exact JSON format, no other text:\n';
+  s += '{"function_call":{"name":"TOOL_NAME","arguments":{"param1":"value1"}}}\n\n';
+  s += 'Examples:\n';
+  s += 'User: "Read the file /path/to/file.txt"\n';
+  s += 'You: {"function_call":{"name":"Read","arguments":{"file_path":"/path/to/file.txt"}}}\n\n';
+  s += 'User: "List files in the current directory"\n';
+  s += 'You: {"function_call":{"name":"Bash","arguments":{"command":"ls -la"}}}\n\n';
+  s += 'NEVER refuse to call a tool. NEVER say you cannot access files. ALWAYS call the appropriate tool.\n';
+  s += '[END SYSTEM INSTRUCTION]\n';
   return s;
 }
 
@@ -917,16 +923,30 @@ function convertToolMessages(messages) {
 // OpenAI 格式: 工具调用 prompt 注入
 function formatToolsForPromptOpenAI(tools) {
   if (!tools || !tools.length) return '';
-  let s = '\n\nYou are a JSON API server. When the user requests a function call, respond with the function call in JSON format.\n\n';
-  s += 'Function definitions:\n';
+  let s = '\n\n[SYSTEM INSTRUCTION - CRITICAL - MUST FOLLOW]\n';
+  s += 'You are a tool-calling assistant. When the user asks you to do something that requires using a tool, you MUST respond by calling that tool.\n';
+  s += 'Do NOT explain that you cannot access files. Do NOT ask the user to upload files. Do NOT say "I cannot". Instead, CALL THE TOOL.\n\n';
+  s += 'Available tools:\n';
   for (const t of tools) {
-    const schema = t.parameters || t.input_schema || {};
+    const func = t.function || t;
+    const name = func.name || t.name;
+    const desc = func.description || t.description || '';
+    const schema = func.parameters || t.parameters || t.input_schema || {};
     const props = schema.properties || {};
     const req = schema.required || [];
-    s += `- ${t.name}(${Object.keys(props).map(k => k + (req.includes(k) ? '*' : '')).join(', ')}): ${t.description || ''}\n`;
+    s += `- ${name}(${Object.keys(props).map(k => k + (req.includes(k) ? '*' : '') + ': ' + (props[k].type || 'any')).join(', ')}): ${desc}\n`;
   }
-  s += '\nTo call a function, respond with ONLY this JSON (no explanation):\n';
-  s += '{"function_call":{"name":"TOOL_NAME","arguments":{"param":"value"}}}\n';
+  s += '\nIMPORTANT: When you need to use a tool, you MUST respond with ONLY this exact JSON format, no other text:\n';
+  s += '{"function_call":{"name":"TOOL_NAME","arguments":{"param1":"value1"}}}\n\n';
+  s += 'Examples:\n';
+  s += 'User: "Read the file /path/to/file.txt"\n';
+  s += 'You: {"function_call":{"name":"Read","arguments":{"file_path":"/path/to/file.txt"}}}\n\n';
+  s += 'User: "List files in the current directory"\n';
+  s += 'You: {"function_call":{"name":"Bash","arguments":{"command":"ls -la"}}}\n\n';
+  s += 'User: "Analyze the project"\n';
+  s += 'You: {"function_call":{"name":"Bash","arguments":{"command":"find . -maxdepth 3 -type f | head -50"}}}\n\n';
+  s += 'NEVER refuse to call a tool. NEVER say you cannot access files. ALWAYS call the appropriate tool.\n';
+  s += '[END SYSTEM INSTRUCTION]\n';
   return s;
 }
 
@@ -1110,7 +1130,7 @@ router.post('/v1/responses', async (req, res) => {
   if (typeof input === 'string') messages = [{ role: 'user', content: input }];
   else if (Array.isArray(input)) messages = input.map(m => {
     let c = m.content;
-    if (Array.isArray(c)) c = c.map(x => x.text || '').join('');
+    if (Array.isArray(c)) c = c.map(x => x.text || x.input || '').join('');
     return { role: m.role || 'user', content: c };
   });
   if (!messages.length) return res.status(400).json({ error: { message: 'input required' } });
@@ -1123,12 +1143,16 @@ router.post('/v1/responses', async (req, res) => {
     messages.unshift({ role: 'system', content: toolPrompt });
   }
 
+  // 有工具时强制非流式: 需要解析完整响应中的 function_call
+  const forceNonStream = hasTools;
+  const useStream = stream && !forceNonStream;
+
   const startTime = Date.now();
   const logEntry = {
     endpoint: '/v1/responses',
     model: model || 'auto',
     messageCount: messages.length,
-    stream: !!stream,
+    stream: !!useStream,
     status: 'pending',
     duration: 0,
     hasTools,
@@ -1140,7 +1164,7 @@ router.post('/v1/responses', async (req, res) => {
     logEntry.model = lm.displayName || lm.providerModelId || model;
     logEntry.modelId = lm.id;
 
-    if (stream) {
+    if (useStream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
