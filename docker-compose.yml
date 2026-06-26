@@ -11,15 +11,21 @@ services:
       - "8500:8080"
     environment:
       MANAGER_PORT: "8080"
-      # 访问 token: 既是管理 UI 的登录密码, 也是 LLM API 的 Bearer token
       MANAGER_TOKEN: "${MANAGER_TOKEN:-changeme}"
       DATA_DIR: "/data"
       PROXY_IMAGE: "ghcr.io/jeck5001/langdock-proxy:latest"
-      # Langdock Cookie (从浏览器抓, 用于 LLM Bridge 调用 app.langdock.com)
       LANGDOCK_COOKIE: "${LANGDOCK_COOKIE:-}"
+      # Agent 工作目录 (Read/Write/Bash 在此目录下执行)
+      # 改成你想让 Codex/Claude Code 访问的项目目录
+      WORKSPACE: "/workspace"
       DEBUG: "${DEBUG:-0}"
     volumes:
-      # docker.sock: 管理反代容器需要; 不用反代管理功能也无所谓, 挂上不碍事
       - /var/run/docker.sock:/var/run/docker.sock
-      # 配置持久化
       - ./data:/data
+      # 挂载你的项目目录到 /workspace
+      # 改成你实际路径, 例如:
+      #   - /Users/jfwang/IdeaProjects/javaTool:/workspace
+      #   - /home/user/projects:/workspace
+      # 或挂载 NAS 上的常用目录:
+      #   - /vol1/1000/projects:/workspace
+      - ./:/workspace
