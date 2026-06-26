@@ -1126,13 +1126,25 @@ router.post('/v1/responses', async (req, res) => {
   }
 
   const { input, model, stream, tools } = req.body || {};
+  // 解析 input, 处理 function_call_output (Codex 发回的工具执行结果)
   let messages = [];
-  if (typeof input === 'string') messages = [{ role: 'user', content: input }];
-  else if (Array.isArray(input)) messages = input.map(m => {
-    let c = m.content;
-    if (Array.isArray(c)) c = c.map(x => x.text || x.input || '').join('');
-    return { role: m.role || 'user', content: c };
-  });
+  if (typeof input === 'string') {
+    messages = [{ role: 'user', content: input }];
+  } else if (Array.isArray(input)) {
+    messages = input.map(m => {
+      // function_call_output 是 Codex 发回的工具执行结果
+      if (m.type === 'function_call_output') {
+        return { role: 'user', content: '[Tool result for ' + (m.call_id || 'unknown') + ']:\n' + m.output };
+      }
+      // function_call 是之前返回的工具调用记录
+      if (m.type === 'function_call') {
+        return { role: 'assistant', content: '{"function_call":{"name":"' + m.name + '","arguments":' + (m.arguments || '{}') + '}}' };
+      }
+      let c = m.content;
+      if (Array.isArray(c)) c = c.map(x => x.text || x.input || '').join('');
+      return { role: m.role || 'user', content: c || '' };
+    });
+  }
   if (!messages.length) return res.status(400).json({ error: { message: 'input required' } });
 
   const hasTools = tools && tools.length > 0;
@@ -1164,7 +1176,109 @@ router.post('/v1/responses', async (req, res) => {
     logEntry.model = lm.displayName || lm.providerModelId || model;
     logEntry.modelId = lm.id;
 
-    if (useStream) {
+    // 有工具时: 非流式调 Langdock, 解析完整文本中的 function_call,
+    // 然后通过 SSE 流返回给 Codex (因为 Codex 期望 SSE)
+    if (hasTools && stream) {
+      // 先非流式调 Langdock 拿完整响应
+      const ld = await callLangdockWithRetry(messages, lm);
+      const text = extractText(ld);
+      logEntry.duration = Date.now() - startTime;
+
+      if (ld.status >= 400) {
+        logEntry.status = 'error';
+        logEntry.error = 'Langdock: ' + ld.body.slice(0, 200);
+        addCallLog(logEntry);
+        // 错误也要通过 SSE 流返回
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        const rid = 'resp_' + uuid().replace(/-/g, '');
+        const sse = (type, data) => { res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`); };
+        sse('response.created', { response: { id: rid, object: 'response', model: model || 'auto', status: 'in_progress', output: [] } });
+        sse('response.in_progress', { response: { id: rid, object: 'response', model: model || 'auto', status: 'in_progress' } });
+        const itemId = 'item_' + uuid().replace(/-/g, '').slice(0, 12);
+        sse('response.output_item.added', { output_index: 0, item: { id: itemId, type: 'message', role: 'assistant', status: 'in_progress', content: [] } });
+        sse('response.content_part.added', { output_index: 0, content_index: 0, part: { type: 'output_text', text: '' } });
+        sse('response.output_text.delta', { output_index: 0, content_index: 0, delta: 'Error: ' + ld.body.slice(0, 200) });
+        sse('response.content_part.done', { output_index: 0, content_index: 0, part: { type: 'output_text', text: 'Error' } });
+        sse('response.output_item.done', { output_index: 0, item: { id: itemId, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'Error' }] } });
+        sse('response.completed', { response: { id: rid, object: 'response', model: model || 'auto', status: 'completed', output: [{ id: itemId, type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Error' }] }] } });
+        res.end();
+        return;
+      }
+
+      // 检测 function_call
+      const calls = parseToolCalls(text);
+      const rid = 'resp_' + uuid().replace(/-/g, '');
+      const itemId = 'item_' + uuid().replace(/-/g, '').slice(0, 12);
+
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      const sse = (type, data) => { res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`); };
+
+      sse('response.created', { response: { id: rid, object: 'response', model: model || 'auto', status: 'in_progress', output: [] } });
+      sse('response.in_progress', { response: { id: rid, object: 'response', model: model || 'auto', status: 'in_progress' } });
+
+      if (calls.length > 0) {
+        // 有工具调用 → 通过 SSE 流返回 function_call 给 Codex
+        const toolCalls = toOpenAIToolCalls(calls);
+        log(`[bridge:codex] 返回 function_call via SSE: ${calls.map(c => c.name).join(', ')}`);
+
+        // 返回 function_call 输出项
+        sse('response.output_item.added', { output_index: 0, item: { id: itemId, type: 'function_call', name: calls[0].name, call_id: toolCalls[0].id, status: 'in_progress' } });
+        sse('response.function_call_arguments.delta', { output_index: 0, item_id: itemId, call_id: toolCalls[0].id, delta: toolCalls[0].function.arguments });
+        sse('response.function_call_arguments.done', { output_index: 0, item_id: itemId, call_id: toolCalls[0].id, arguments: toolCalls[0].function.arguments });
+
+        // 如果有多个工具调用
+        for (let i = 1; i < calls.length; i++) {
+          const tc = toolCalls[i];
+          const iid2 = 'item_' + uuid().replace(/-/g, '').slice(0, 12);
+          sse('response.output_item.added', { output_index: i, item: { id: iid2, type: 'function_call', name: calls[i].name, call_id: tc.id, status: 'in_progress' } });
+          sse('response.function_call_arguments.delta', { output_index: i, item_id: iid2, call_id: tc.id, delta: tc.function.arguments });
+          sse('response.function_call_arguments.done', { output_index: i, item_id: iid2, call_id: tc.id, arguments: tc.function.arguments });
+        }
+
+        const output = calls.map((c, i) => ({
+          id: itemId + (i > 0 ? '_' + i : ''),
+          type: 'function_call',
+          name: c.name,
+          call_id: toolCalls[i].id,
+          arguments: toolCalls[i].function.arguments,
+          status: 'completed',
+        }));
+
+        sse('response.completed', { response: { id: rid, object: 'response', model: model || 'auto', status: 'completed', output } });
+        res.end();
+
+        logEntry.status = 'success';
+        logEntry.outputText = '(function_call: ' + calls.map(c => c.name).join(', ') + ')';
+        logEntry.responsePreview = logEntry.outputText;
+        addCallLog(logEntry);
+      } else {
+        // 没有工具调用 → 普通文本, 通过 SSE 流返回
+        sse('response.output_item.added', { output_index: 0, item: { id: itemId, type: 'message', role: 'assistant', status: 'in_progress', content: [] } });
+        sse('response.content_part.added', { output_index: 0, content_index: 0, part: { type: 'output_text', text: '' } });
+        // 逐块发送文本 (模拟流式)
+        const chunks = text.match(/.{1,5}/g) || [text];
+        for (const chunk of chunks) {
+          sse('response.output_text.delta', { output_index: 0, content_index: 0, delta: chunk });
+        }
+        sse('response.content_part.done', { output_index: 0, content_index: 0, part: { type: 'output_text', text } });
+        sse('response.output_item.done', { output_index: 0, item: { id: itemId, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text }] } });
+        sse('response.completed', { response: { id: rid, object: 'response', model: model || 'auto', status: 'completed', output: [{ id: itemId, type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] }] } });
+        res.end();
+
+        logEntry.status = 'success';
+        logEntry.outputText = text;
+        logEntry.responsePreview = text.slice(0, 200);
+        addCallLog(logEntry);
+      }
+
+      addConversation({ title: messages[messages.length - 1]?.content?.slice(0, 50) || '新对话', model: logEntry.model, messages, response: logEntry.outputText, endpoint: 'responses' });
+      return;
+    }
+
+    // 普通流式 (无工具)
+    if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
