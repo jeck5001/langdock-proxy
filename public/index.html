@@ -5,211 +5,186 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Langdock Proxy Manager</title>
 <style>
+  :root { color-scheme: light; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f6fa; color: #2d3436; }
-  .container { max-width: 1100px; margin: 0 auto; padding: 20px; }
-
-  /* 登录 */
+  .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
   #login { max-width: 360px; margin: 80px auto; background: #fff; padding: 32px; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); }
   #login h1 { font-size: 20px; margin-bottom: 8px; }
   #login p { color: #636e72; font-size: 13px; margin-bottom: 20px; }
   #login input { width: 100%; padding: 10px 12px; border: 1px solid #dfe6e9; border-radius: 6px; font-size: 14px; margin-bottom: 12px; }
   #login button { width: 100%; padding: 10px; background: #0984e3; color: #fff; border: none; border-radius: 6px; font-size: 14px; cursor: pointer; }
   #login button:hover { background: #0748a8; }
-
-  /* 主界面 */
   .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
   .header h1 { font-size: 22px; }
-  .header .actions button { margin-left: 8px; padding: 8px 14px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  .header .actions { display: flex; gap: 8px; }
+  .btn { padding: 8px 14px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; }
   .btn-primary { background: #0984e3; color: #fff; }
   .btn-primary:hover { background: #0748a8; }
-  .btn-logout { background: #dfe6e9; color: #2d3436; }
-
-  /* 代理卡片 */
-  .proxy-list { display: grid; grid-template-columns: 1fr; gap: 12px; }
-  .proxy-card { background: #fff; border-radius: 10px; padding: 16px 20px; box-shadow: 0 1px 4px rgba(0,0,0,0.06); display: flex; justify-content: space-between; align-items: center; }
-  .proxy-info .name { font-weight: 600; font-size: 15px; }
-  .proxy-info .meta { color: #636e72; font-size: 12px; margin-top: 4px; }
-  .proxy-info .meta span { margin-right: 12px; }
-  .proxy-actions { display: flex; gap: 6px; }
-  .proxy-actions button { padding: 6px 10px; border: 1px solid #dfe6e9; background: #fff; border-radius: 4px; cursor: pointer; font-size: 12px; }
-  .proxy-actions button:hover { background: #f5f6fa; }
-  .proxy-actions .danger { color: #d63031; border-color: #fab1a0; }
-
-  /* 状态徽章 */
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
-  .badge-running { background: #00b894; color: #fff; }
-  .badge-stopped { background: #dfe6e9; color: #636e72; }
-  .badge-error { background: #d63031; color: #fff; }
-
-  /* 模态框 */
-  .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 100; }
-  .modal-overlay.active { display: flex; align-items: center; justify-content: center; }
-  .modal { background: #fff; border-radius: 12px; padding: 24px; width: 480px; max-width: 90vw; max-height: 90vh; overflow-y: auto; }
-  .modal h2 { font-size: 18px; margin-bottom: 16px; }
-  .modal .field { margin-bottom: 14px; }
-  .modal label { display: block; font-size: 12px; color: #636e72; margin-bottom: 4px; }
-  .modal input, .modal select { width: 100%; padding: 8px 10px; border: 1px solid #dfe6e9; border-radius: 6px; font-size: 13px; }
-  .modal .form-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
-  .modal .form-actions button { padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; }
-  .modal .cancel { background: #dfe6e9; }
-  .modal .save { background: #0984e3; color: #fff; }
-
-  /* 日志面板 */
-  .logs-panel { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 100; }
-  .logs-panel.active { display: flex; flex-direction: column; }
-  .logs-panel .logs-header { background: #2d3436; color: #fff; padding: 12px 20px; display: flex; justify-content: space-between; align-items: center; }
-  .logs-panel .logs-header h3 { font-size: 14px; }
-  .logs-panel .logs-header button { background: transparent; color: #fff; border: 1px solid #636e72; border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: 12px; }
-  .logs-panel .logs-body { flex: 1; background: #1e272e; color: #d2d9db; font-family: "SF Mono", Menlo, monospace; font-size: 12px; padding: 16px; overflow: auto; white-space: pre-wrap; word-break: break-all; }
-  .logs-panel .logs-body .line { line-height: 1.6; }
-
-  .empty { text-align: center; color: #b2bec3; padding: 60px 20px; }
-  .empty p { font-size: 14px; margin-top: 8px; }
-
-  /* 标签页按钮 */
+  .btn-ghost { background: #e9ecef; color: #495057; }
+  .btn-ghost:hover { background: #dee2e6; }
+  .btn-danger { background: #dc3545; color: #fff; }
+  .btn-sm { padding: 6px 10px; font-size: 12px; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; }
   .tab-btn { padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; background: #e9ecef; color: #495057; }
   .tab-btn.active { background: #0984e3; color: #fff; }
   .tab-btn:hover:not(.active) { background: #dee2e6; }
-
-  /* 日志表格 */
-  .log-table th { font-weight: 600; font-size: 12px; color: #6c757d; text-transform: uppercase; letter-spacing: 0.5px; }
-  .log-table td { padding: 10px 12px; border-bottom: 1px solid #f1f3f5; vertical-align: middle; }
-  .log-table tr:hover { background: #f8f9fa; }
-
-  /* 状态徽章 */
+  .card { background: #fff; border-radius: 10px; padding: 16px 20px; box-shadow: 0 1px 4px rgba(0,0,0,0.06); margin-bottom: 12px; }
+  .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .stat-card { background: #fff; padding: 16px; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,0.06); }
+  .stat-card .label { font-size: 11px; color: #6c757d; text-transform: uppercase; }
+  .stat-card .value { font-size: 24px; font-weight: 600; margin-top: 4px; }
+  .stat-card .value.success { color: #28a745; }
+  .stat-card .value.error { color: #dc3545; }
+  .table-wrapper { background: #fff; border-radius: 10px; overflow: auto; max-height: 70vh; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { font-weight: 600; font-size: 12px; color: #6c757d; text-transform: uppercase; padding: 12px; text-align: left; border-bottom: 2px solid #e9ecef; position: sticky; top: 0; background: #fff; }
+  td { padding: 10px 12px; border-bottom: 1px solid #f1f3f5; }
+  tr:hover { background: #f8f9fa; }
   .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .badge-success { background: #d4edda; color: #155724; }
+  .badge-error { background: #f8d7da; color: #721c24; }
+  .badge-warning { background: #fff3cd; color: #856404; }
+  .form-group { margin-bottom: 14px; }
+  .form-group label { display: block; font-size: 12px; color: #636e72; margin-bottom: 4px; }
+  .form-group input, .form-group select { width: 100%; padding: 10px 12px; border: 1px solid #dfe6e9; border-radius: 6px; font-size: 13px; }
+  .form-group input:focus { outline: none; border-color: #0984e3; }
+  .form-row { display: flex; gap: 12px; }
+  .form-row .form-group { flex: 1; }
+  .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 100; }
+  .modal-overlay.active { display: flex; align-items: center; justify-content: center; }
+  .modal { background: #fff; border-radius: 12px; padding: 24px; width: 500px; max-width: 90vw; max-height: 90vh; overflow-y: auto; }
+  .modal h2 { font-size: 18px; margin-bottom: 20px; }
+  .modal .form-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+  .proxy-card { display: flex; justify-content: space-between; align-items: center; }
+  .proxy-info .name { font-weight: 600; font-size: 15px; }
+  .proxy-info .meta { color: #636e72; font-size: 12px; margin-top: 4px; }
+  .proxy-info .meta span { margin-right: 12px; }
+  .proxy-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  .log-panel { background: #1e272e; color: #d2d9db; font-family: "SF Mono", Menlo, monospace; font-size: 12px; padding: 16px; border-radius: 10px; max-height: 60vh; overflow: auto; white-space: pre-wrap; word-break: break-all; line-height: 1.6; }
+  .health-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .health-item { display: flex; align-items: center; gap: 8px; padding: 12px; background: #fff; border-radius: 8px; }
+  .health-dot { width: 10px; height: 10px; border-radius: 50%; }
+  .health-dot.ok { background: #28a745; }
+  .health-dot.warn { background: #ffc107; }
+  .health-dot.error { background: #dc3545; }
+  .empty { text-align: center; color: #b2bec3; padding: 40px 20px; }
 </style>
 </head>
 <body>
 
 <!-- 登录 -->
 <div id="login">
-  <h1>Langdock Proxy Manager</h1>
-  <p>输入访问 Token 登录管理界面</p>
+  <h1>Langdock Proxy</h1>
+  <p>输入访问 Token 登录</p>
   <input type="password" id="tokenInput" placeholder="Token" autofocus>
   <button onclick="doLogin()">登录</button>
-  <div id="loginError" style="color:#d63031;font-size:12px;margin-top:8px;display:none;">Token 无效</div>
+  <div id="loginError" style="color:#dc3545;font-size:12px;margin-top:8px;display:none;">Token 无效</div>
 </div>
 
 <!-- 主界面 -->
 <div id="main" style="display:none;">
   <div class="container">
     <div class="header">
-      <h1>Langdock 管理</h1>
+      <h1>Langdock Proxy</h1>
       <div class="actions">
-        <button class="btn-logout" onclick="logout()">退出</button>
+        <button class="btn btn-ghost btn-sm" onclick="refresh()">刷新</button>
+        <button class="btn btn-ghost btn-sm" onclick="logout()">退出</button>
       </div>
     </div>
 
-    <!-- 标签页导航 -->
-    <div class="tabs" style="display:flex;gap:8px;margin-bottom:20px;">
-      <button class="tab-btn active" onclick="switchTab('proxies', this)" id="tabProxies">代理管理</button>
-      <button class="tab-btn" onclick="switchTab('logs', this)" id="tabLogs">调用日志</button>
+    <div class="tabs">
+      <button class="tab-btn active" data-tab="proxies" onclick="switchTab('proxies')">代理管理</button>
+      <button class="tab-btn" data-tab="models" onclick="switchTab('models')">模型</button>
+      <button class="tab-btn" data-tab="health" onclick="switchTab('health')">系统</button>
+      <button class="tab-btn" data-tab="logs" onclick="switchTab('logs')">日志</button>
     </div>
 
-    <!-- 代理管理页 -->
-    <div id="pageProxies">
-      <div style="margin-bottom:16px;">
-        <button class="btn-primary" onclick="openCreateModal()">+ 新建代理</button>
+    <!-- 代理管理 -->
+    <div id="tab-proxies" class="tab-content">
+      <div style="display:flex;justify-content:flex-end;margin-bottom:12px;">
+        <button class="btn btn-primary btn-sm" onclick="showCreateModal()">+ 新建代理</button>
       </div>
-      <div class="proxy-list" id="proxyList"></div>
-      <div class="empty" id="emptyState" style="display:none;">
-        <p>还没有代理，点击「新建代理」创建第一个</p>
-      </div>
+      <div id="proxyList"></div>
+      <div id="proxyEmpty" class="empty" style="display:none;">还没有代理</div>
     </div>
 
-    <!-- 调用日志页 -->
-    <div id="pageLogs" style="display:none;">
-      <div class="log-stats" id="logStats" style="display:flex;gap:16px;margin-bottom:16px;flex-wrap:wrap;"></div>
-      <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;">
-        <button class="btn-primary btn-sm" onclick="refreshLogs()">刷新</button>
-        <label style="font-size:12px;color:#636e72;">
-          <input type="checkbox" id="autoRefreshLogs" onchange="toggleAutoRefresh()"> 自动刷新 (3秒)
-        </label>
+    <!-- 模型列表 -->
+    <div id="tab-models" class="tab-content" style="display:none;">
+      <div id="modelList"></div>
+    </div>
+
+    <!-- 系统状态 -->
+    <div id="tab-health" class="tab-content" style="display:none;">
+      <div id="healthContent"></div>
+    </div>
+
+    <!-- 日志 -->
+    <div id="tab-logs" class="tab-content" style="display:none;">
+      <div style="display:flex;justify-content:flex-end;margin-bottom:12px;">
+        <button class="btn btn-primary btn-sm" onclick="refreshLogs()">刷新</button>
       </div>
-      <div class="log-table-wrapper" style="background:#fff;border-radius:10px;overflow:auto;max-height:70vh;">
-        <table class="log-table" id="logTable" style="width:100%;border-collapse:collapse;font-size:13px;">
-          <thead>
-            <tr style="background:#f8f9fa;position:sticky;top:0;">
-              <th style="padding:10px 12px;text-align:left;border-bottom:1px solid #e9ecef;">时间</th>
-              <th style="padding:10px 12px;text-align:left;border-bottom:1px solid #e9ecef;">端点</th>
-              <th style="padding:10px 12px;text-align:left;border-bottom:1px solid #e9ecef;">模型</th>
-              <th style="padding:10px 12px;text-align:center;border-bottom:1px solid #e9ecef;">消息数</th>
-              <th style="padding:10px 12px;text-align:center;border-bottom:1px solid #e9ecef;">流式</th>
-              <th style="padding:10px 12px;text-align:center;border-bottom:1px solid #e9ecef;">状态</th>
-              <th style="padding:10px 12px;text-align:right;border-bottom:1px solid #e9ecef;">耗时</th>
-              <th style="padding:10px 12px;text-align:left;border-bottom:1px solid #e9ecef;">响应预览</th>
-            </tr>
-          </thead>
-          <tbody id="logBody"></tbody>
-        </table>
-      </div>
-      <div id="logEmpty" class="empty" style="display:none;"><p>暂无调用日志</p></div>
+      <div id="logStats" class="stats-grid"></div>
+      <div id="logContent" class="log-panel" style="min-height:200px;">加载中...</div>
     </div>
   </div>
 </div>
 
-<!-- 创建/编辑模态框 -->
-<div class="modal-overlay" id="modalOverlay">
+<!-- 新建/编辑代理模态 -->
+<div class="modal-overlay" id="editModal">
   <div class="modal">
-    <h2 id="modalTitle">新建代理</h2>
+    <h2 id="editTitle">新建代理</h2>
     <input type="hidden" id="editId">
-    <div class="field">
-      <label>名称 (唯一标识)</label>
+    <div class="form-group">
+      <label>名称</label>
       <input type="text" id="f_name" placeholder="langdock">
     </div>
-    <div class="field">
+    <div class="form-group">
       <label>目标 URL</label>
       <input type="text" id="f_target" placeholder="https://app.langdock.com">
     </div>
-    <div class="field">
-      <label>端口 (宿主机映射)</label>
-      <input type="number" id="f_port" placeholder="3001" value="3001">
+    <div class="form-row">
+      <div class="form-group">
+        <label>端口</label>
+        <input type="number" id="f_port" value="3001">
+      </div>
+      <div class="form-group">
+        <label>路径前缀</label>
+        <input type="text" id="f_prefix" placeholder="/langdock">
+      </div>
     </div>
-    <div class="field">
-      <label>路径前缀 (可选)</label>
-      <input type="text" id="f_prefix" placeholder="/langdock">
+    <div class="form-group">
+      <label>Cookie Domain (可选)</label>
+      <input type="text" id="f_cookieDomain" placeholder="chat.mydomain.com">
     </div>
-    <div class="field">
-      <label>Cookie Domain (可选, 留空用请求 Host)</label>
-      <input type="text" id="f_cookieDomain" placeholder="">
-    </div>
-    <div class="field">
+    <div class="form-group">
       <label>重写响应体 URL</label>
       <select id="f_rewriteBody">
-        <option value="true">是 (推荐)</option>
+        <option value="true">是</option>
         <option value="false">否</option>
       </select>
     </div>
-    <div class="field">
-      <label>调试日志</label>
-      <select id="f_debug">
-        <option value="false">关闭</option>
-        <option value="true">开启</option>
-      </select>
-    </div>
     <div class="form-actions">
-      <button class="cancel" onclick="closeModal()">取消</button>
-      <button class="save" onclick="saveProxy()">保存</button>
+      <button class="btn btn-ghost" onclick="closeModal('editModal')">取消</button>
+      <button class="btn btn-primary" onclick="saveProxy()">保存</button>
     </div>
   </div>
 </div>
 
-<!-- 日志面板 -->
-<div class="logs-panel" id="logsPanel">
-  <div class="logs-header">
-    <h3 id="logsTitle">日志</h3>
-    <div>
-      <button onclick="refreshLogs()">刷新</button>
-      <button onclick="closeLogs()">关闭</button>
+<!-- 日志详情模态 -->
+<div class="modal-overlay" id="logModal">
+  <div class="modal" style="width:700px;">
+    <h2>日志详情</h2>
+    <div id="logDetail" class="log-panel" style="max-height:70vh;"></div>
+    <div class="form-actions">
+      <button class="btn btn-ghost" onclick="closeModal('logModal')">关闭</button>
     </div>
   </div>
-  <div class="logs-body" id="logsBody"></div>
 </div>
 
 <script>
 let token = localStorage.getItem('mgr_token') || '';
+let currentTab = 'proxies';
 
 // ---------- API ----------
 async function api(method, path, body) {
@@ -232,9 +207,7 @@ async function doLogin() {
     } else {
       document.getElementById('loginError').style.display = 'block';
     }
-  } catch {
-    document.getElementById('loginError').style.display = 'block';
-  }
+  } catch { document.getElementById('loginError').style.display = 'block'; }
 }
 
 function logout() {
@@ -245,111 +218,88 @@ function logout() {
   document.getElementById('tokenInput').value = '';
 }
 
-async function showMain() {
+function showMain() {
   document.getElementById('login').style.display = 'none';
   document.getElementById('main').style.display = 'block';
-  await loadProxies();
+  switchTab('proxies');
 }
 
-// ---------- 代理列表 ----------
+// ---------- 标签页切换 ----------
+function switchTab(tab) {
+  currentTab = tab;
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelector(`.tab-btn[data-tab="${tab}"]`).classList.add('active');
+  document.querySelectorAll('.tab-content').forEach(c => c.style.display = 'none');
+  document.getElementById('tab-' + tab).style.display = 'block';
+  if (tab === 'proxies') loadProxies();
+  if (tab === 'models') loadModels();
+  if (tab === 'health') loadHealth();
+  if (tab === 'logs') refreshLogs();
+}
+
+function refresh() { switchTab(currentTab); }
+
+// ---------- 代理管理 ----------
 async function loadProxies() {
+  const list = document.getElementById('proxyList');
+  const empty = document.getElementById('proxyEmpty');
   try {
     const data = await api('GET', '/proxies');
-    const list = document.getElementById('proxyList');
-    const empty = document.getElementById('emptyState');
-    list.innerHTML = '';
-    if (!data.proxies || data.proxies.length === 0) {
-      empty.style.display = 'block';
-      return;
+    if (!data.proxies || !data.proxies.length) {
+      list.innerHTML = ''; empty.style.display = 'block'; return;
     }
     empty.style.display = 'none';
-    data.proxies.forEach(p => {
-      const status = p.status || {};
-      const running = status.running;
-      const badge = running
-        ? '<span class="badge badge-running">运行中</span>'
-        : '<span class="badge badge-stopped">已停止</span>';
-      const card = document.createElement('div');
-      card.className = 'proxy-card';
-      card.innerHTML = `
-        <div class="proxy-info">
-          <div class="name">${escapeHtml(p.name)} ${badge}</div>
-          <div class="meta">
-            <span>→ ${escapeHtml(p.target)}</span>
-            <span>端口 :${p.port}</span>
-            ${p.prefix ? '<span>前缀 ' + escapeHtml(p.prefix) + '</span>' : ''}
-            <span>ID ${p.id}</span>
-          </div>
-        </div>
-        <div class="proxy-actions">
-          <button onclick="toggleProxy('${p.id}', ${running})">${running ? '停止' : '启动'}</button>
-          <button onclick="restartProxy('${p.id}')">重启</button>
-          <button onclick="showLogs('${p.id}', '${escapeHtml(p.name)}')">日志</button>
-          <button onclick="editProxy('${p.id}')">编辑</button>
-          <button class="danger" onclick="deleteProxy('${p.id}', '${escapeHtml(p.name)}')">删除</button>
-        </div>`;
-      list.appendChild(card);
-    });
-  } catch (e) {
-    console.error(e);
-  }
+    list.innerHTML = data.proxies.map(p => {
+      const s = p.status || {};
+      const running = s.running;
+      const badge = running ? '<span class="badge badge-success">运行中</span>' : '<span class="badge badge-warning">已停止</span>';
+      return `<div class="card"><div class="proxy-card"><div class="proxy-info">
+        <div class="name">${esc(p.name)} ${badge}</div>
+        <div class="meta"><span>→ ${esc(p.target)}</span><span>:${p.port}</span>${p.prefix ? ' <span>'+esc(p.prefix)+'</span>' : ''}</div>
+      </div><div class="proxy-actions">
+        ${running ? `<button class="btn btn-ghost btn-sm" onclick="proxyAction('${p.id}','stop')">停止</button>` : `<button class="btn btn-primary btn-sm" onclick="proxyAction('${p.id}','start')">启动</button>`}
+        <button class="btn btn-ghost btn-sm" onclick="proxyAction('${p.id}','restart')">重启</button>
+        <button class="btn btn-ghost btn-sm" onclick="editProxy('${p.id}')">编辑</button>
+        <button class="btn btn-danger btn-sm" onclick="deleteProxy('${p.id}','${esc(p.name)}')">删除</button>
+      </div></div></div>`;
+    }).join('');
+  } catch (e) { list.innerHTML = `<div class="empty">加载失败: ${e.message}</div>`; }
 }
 
-function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]); }
-
-// ---------- 启停 ----------
-async function toggleProxy(id, running) {
-  try {
-    await api('POST', '/proxies/' + id + '/' + (running ? 'stop' : 'start'));
-    await loadProxies();
-  } catch (e) { alert(e.message); }
+async function proxyAction(id, action) {
+  try { await api('POST', `/proxies/${id}/${action}`); loadProxies(); } catch (e) { alert(e.message); }
 }
 
-async function restartProxy(id) {
-  try {
-    await api('POST', '/proxies/' + id + '/restart');
-    await loadProxies();
-  } catch (e) { alert(e.message); }
-}
-
-// ---------- 删除 ----------
 async function deleteProxy(id, name) {
-  if (!confirm('确定删除代理 ' + name + ' ? 容器会被停止并删除.')) return;
-  try {
-    await api('DELETE', '/proxies/' + id);
-    await loadProxies();
-  } catch (e) { alert(e.message); }
+  if (!confirm('确定删除 ' + name + ' ?')) return;
+  try { await api('DELETE', '/proxies/' + id); loadProxies(); } catch (e) { alert(e.message); }
 }
 
-// ---------- 创建/编辑 ----------
-function openCreateModal() {
-  document.getElementById('modalTitle').textContent = '新建代理';
+function showCreateModal() {
+  document.getElementById('editTitle').textContent = '新建代理';
   document.getElementById('editId').value = '';
   document.getElementById('f_name').value = '';
-  document.getElementById('f_name').disabled = false;
-  document.getElementById('f_target').value = 'https://app.langdock.com';
+  document.getElementById('f_target').value = '';
   document.getElementById('f_port').value = '3001';
   document.getElementById('f_prefix').value = '';
   document.getElementById('f_cookieDomain').value = '';
   document.getElementById('f_rewriteBody').value = 'true';
-  document.getElementById('f_debug').value = 'false';
-  document.getElementById('modalOverlay').classList.add('active');
+  openModal('editModal');
 }
 
 async function editProxy(id) {
   try {
-    const p = await api('GET', '/proxies/' + id);
-    document.getElementById('modalTitle').textContent = '编辑代理';
+    const data = await api('GET', '/proxies/' + id);
+    const p = data.proxy || data;
+    document.getElementById('editTitle').textContent = '编辑代理';
     document.getElementById('editId').value = p.id;
     document.getElementById('f_name').value = p.name;
-    document.getElementById('f_name').disabled = true;
     document.getElementById('f_target').value = p.target;
     document.getElementById('f_port').value = p.port;
     document.getElementById('f_prefix').value = p.prefix || '';
     document.getElementById('f_cookieDomain').value = p.cookieDomain || '';
     document.getElementById('f_rewriteBody').value = String(p.rewriteBody !== false);
-    document.getElementById('f_debug').value = String(!!p.debug);
-    document.getElementById('modalOverlay').classList.add('active');
+    openModal('editModal');
   } catch (e) { alert(e.message); }
 }
 
@@ -362,143 +312,92 @@ async function saveProxy() {
     prefix: document.getElementById('f_prefix').value.trim(),
     cookieDomain: document.getElementById('f_cookieDomain').value.trim(),
     rewriteBody: document.getElementById('f_rewriteBody').value === 'true',
-    debug: document.getElementById('f_debug').value === 'true',
   };
   if (!body.name || !body.target) { alert('名称和目标必填'); return; }
   try {
-    if (id) {
-      await api('PUT', '/proxies/' + id, body);
-    } else {
-      await api('POST', '/proxies', body);
-    }
-    closeModal();
-    await loadProxies();
+    if (id) await api('PUT', '/proxies/' + id, body);
+    else await api('POST', '/proxies', body);
+    closeModal('editModal'); loadProxies();
   } catch (e) { alert(e.message); }
 }
 
-function closeModal() {
-  document.getElementById('modalOverlay').classList.remove('active');
+// ---------- 模型列表 ----------
+async function loadModels() {
+  const list = document.getElementById('modelList');
+  list.innerHTML = '<div class="empty">加载中...</div>';
+  try {
+    const data = await api('GET', '/v1/models');
+    list.innerHTML = `<div class="table-wrapper"><table>
+      <thead><tr><th>模型 ID</th><th>显示名</th><th>提供商</th></tr></thead>
+      <tbody>${data.data.map(m => `<tr>
+        <td><code>${esc(m.id)}</code></td>
+        <td>${esc(m.display_name || '-')}</td>
+        <td>${esc(m.owned_by)}</td>
+      </tr>`).join('')}</tbody>
+    </table></div>`;
+  } catch (e) { list.innerHTML = `<div class="empty">加载失败: ${e.message}</div>`; }
+}
+
+// ---------- 系统状态 ----------
+async function loadHealth() {
+  const content = document.getElementById('healthContent');
+  content.innerHTML = '<div class="empty">检查中...</div>';
+  try {
+    const health = await api('GET', '/bridge/health');
+    const dot = health.langdock?.reachable ? 'ok' : (health.langdock?.configured ? 'error' : 'warn');
+    const dotLabel = health.langdock?.reachable ? '正常' : (health.langdock?.configured ? '不可达' : '未配置');
+    content.innerHTML = `
+      <div class="health-grid">
+        <div class="health-item"><div class="health-dot ${dot}"></div><div><div style="font-weight:600;">Langdock 连接</div><div style="font-size:12px;color:#636e72;">${dotLabel}</div></div></div>
+        <div class="health-item"><div class="health-dot ${health.langdock?.configured ? 'ok' : 'warn'}"></div><div><div style="font-weight:600;">Cookie</div><div style="font-size:12px;color:#636e72;">${health.langdock?.configured ? '已配置' : '未配置'}</div></div></div>
+        <div class="health-item"><div class="health-dot ok"></div><div><div style="font-weight:600;">运行时间</div><div style="font-size:12px;color:#636e72;">${Math.floor(health.uptime / 60)} 分钟</div></div></div>
+      </div>
+    `;
+  } catch (e) { content.innerHTML = `<div class="empty">检查失败: ${e.message}</div>`; }
 }
 
 // ---------- 日志 ----------
-let currentLogsId = null;
-async function showLogs(id, name) {
-  currentLogsId = id;
-  document.getElementById('logsTitle').textContent = '日志 - ' + name;
-  document.getElementById('logsPanel').classList.add('active');
-  await refreshLogs();
-}
-
-async function refreshLogs() {
-  if (!currentLogsId) return;
-  try {
-    const data = await api('GET', '/proxies/' + currentLogsId + '/logs?tail=200');
-    const body = document.getElementById('logsBody');
-    body.innerHTML = '';
-    const lines = (data.logs || '').split('\n');
-    lines.forEach(line => {
-      const div = document.createElement('div');
-      div.className = 'line';
-      div.textContent = line;
-      body.appendChild(div);
-    });
-    body.scrollTop = body.scrollHeight;
-  } catch (e) { alert(e.message); }
-}
-
-function closeLogs() {
-  document.getElementById('logsPanel').classList.remove('active');
-  currentLogsId = null;
-}
-
-// ---------- 标签页切换 ----------
-let currentTab = 'proxies';
-function switchTab(tab, btn) {
-  currentTab = tab;
-  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  document.getElementById('pageProxies').style.display = tab === 'proxies' ? 'block' : 'none';
-  document.getElementById('pageLogs').style.display = tab === 'logs' ? 'block' : 'none';
-  if (tab === 'logs') refreshLogs();
-}
-
-// ---------- 调用日志 ----------
-let logAutoRefreshTimer = null;
-
-function toggleAutoRefresh() {
-  if (document.getElementById('autoRefreshLogs').checked) {
-    logAutoRefreshTimer = setInterval(refreshLogs, 3000);
-  } else {
-    clearInterval(logAutoRefreshTimer);
-    logAutoRefreshTimer = null;
-  }
-}
-
 async function refreshLogs() {
   try {
     const data = await api('GET', '/bridge/logs?limit=200');
-    // 统计
     const stats = data.stats || {};
-    const statsEl = document.getElementById('logStats');
-    statsEl.innerHTML = `
-      <div style="background:#fff;padding:12px 16px;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,0.06);">
-        <div style="font-size:11px;color:#6c757d;">总调用</div>
-        <div style="font-size:20px;font-weight:600;">${stats.total || 0}</div>
-      </div>
-      <div style="background:#fff;padding:12px 16px;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,0.06);">
-        <div style="font-size:11px;color:#28a745;">成功</div>
-        <div style="font-size:20px;font-weight:600;color:#28a745;">${stats.success || 0}</div>
-      </div>
-      <div style="background:#fff;padding:12px 16px;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,0.06);">
-        <div style="font-size:11px;color:#dc3545;">失败</div>
-        <div style="font-size:20px;font-weight:600;color:#dc3545;">${stats.errors || 0}</div>
-      </div>
-      <div style="background:#fff;padding:12px 16px;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,0.06);">
-        <div style="font-size:11px;color:#6c757d;">平均耗时</div>
-        <div style="font-size:20px;font-weight:600;">${stats.avgDuration || 0}ms</div>
-      </div>
+    document.getElementById('logStats').innerHTML = `
+      <div class="stat-card"><div class="label">总调用</div><div class="value">${stats.total || 0}</div></div>
+      <div class="stat-card"><div class="label">成功</div><div class="value success">${stats.success || 0}</div></div>
+      <div class="stat-card"><div class="label">失败</div><div class="value error">${stats.errors || 0}</div></div>
+      <div class="stat-card"><div class="label">平均耗时</div><div class="value">${stats.avgDuration || 0}ms</div></div>
     `;
-    // 日志表格
     const logs = data.logs || [];
-    const tbody = document.getElementById('logBody');
-    const empty = document.getElementById('logEmpty');
-    if (logs.length === 0) {
-      tbody.innerHTML = '';
-      empty.style.display = 'block';
-      return;
-    }
-    empty.style.display = 'none';
-    tbody.innerHTML = logs.map(l => {
-      const time = l.timestamp ? new Date(l.timestamp).toLocaleTimeString() : '-';
-      const statusBadge = l.status === 'success'
-        ? '<span class="badge" style="background:#d4edda;color:#155724;">成功</span>'
-        : l.status === 'error'
-        ? '<span class="badge" style="background:#f8d7da;color:#721c24;">失败</span>'
-        : '<span class="badge" style="background:#fff3cd;color:#856404;">进行中</span>';
-      const preview = l.responsePreview ? escapeHtml(l.responsePreview).slice(0, 80) : (l.error ? '<span style="color:#dc3545;">' + escapeHtml(l.error).slice(0, 80) + '</span>' : '-');
-      const endpoint = (l.endpoint || '').replace('/v1/', '');
-      return `<tr>
-        <td style="font-family:monospace;font-size:12px;">${time}</td>
-        <td><code style="font-size:11px;background:#f1f3f5;padding:2px 6px;border-radius:3px;">${endpoint}</code></td>
-        <td>${escapeHtml(l.model || '-')}</td>
-        <td style="text-align:center;">${l.messageCount || '-'}</td>
-        <td style="text-align:center;">${l.stream ? '✓' : '-'}</td>
-        <td style="text-align:center;">${statusBadge}</td>
-        <td style="text-align:right;font-family:monospace;">${l.duration || 0}ms</td>
-        <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${preview}</td>
-      </tr>`;
+    const content = document.getElementById('logContent');
+    if (!logs.length) { content.innerHTML = '<div class="empty">暂无日志</div>'; return; }
+    content.innerHTML = logs.map(l => {
+      const time = l.timestamp ? new Date(l.timestamp).toLocaleString() : '-';
+      const status = l.status === 'success' ? '✅' : l.status === 'error' ? '❌' : '⏳';
+      return `<div>${status} ${time} | ${l.endpoint || '-'} | ${l.model || '-'} | ${l.messageCount || 0} msgs | ${l.duration || 0}ms${l.error ? ' | ' + esc(l.error.slice(0,80)) : ''}</div>`;
     }).join('');
-  } catch (e) {
-    console.error('load logs error:', e);
-  }
+  } catch (e) { document.getElementById('logContent').innerHTML = '加载失败: ' + e.message; }
 }
+
+// ---------- 模态框 ----------
+function openModal(id) { document.getElementById(id).classList.add('active'); }
+function closeModal(id) { document.getElementById(id).classList.remove('active'); }
+
+// 点击背景关闭
+document.querySelectorAll('.modal-overlay').forEach(o => {
+  o.addEventListener('click', e => { if (e.target === o) closeModal(o.id); });
+});
+
+// ---------- 工具函数 ----------
+function esc(s) { return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
 // ---------- 初始化 ----------
 if (token) {
   fetch('/api/auth/verify', { headers: { 'Authorization': 'Bearer ' + token } })
-    .then(r => { if (r.ok) showMain(); })
-    .catch(() => {});
+    .then(r => { if (r.ok) showMain(); else logout(); })
+    .catch(() => logout());
 }
+
+document.getElementById('tokenInput').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
 </script>
 </body>
 </html>
