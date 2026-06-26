@@ -168,6 +168,16 @@ app.use('/api', (req, res, next) => {
   auth(req, res, next);
 });
 
+// 代理 /api/v1/* 到 bridge 的 /v1/* 路由
+// bridge 模块的路由是 /v1/*, 但 UI 的 api() 函数会加 /api 前缀
+// 这里我们需要把 /api/v1/* 的请求转发给 bridge 处理
+app.use('/api/v1', auth, (req, res, next) => {
+  // bridge 模块期望路径是 /v1/*, 所以需要重写
+  req.url = '/v1' + req.url;
+  req.originalUrl = '/v1' + req.originalUrl;
+  bridgeModule(req, res, next);
+});
+
 // ---------- LLM Bridge (OpenAI/Claude/Codex 兼容 API) ----------
 const bridgeModule = require('./bridge');
 
