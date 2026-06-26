@@ -43,6 +43,11 @@ try {
 }
 
 // ---------- 配置存储 ----------
+// 确保 data 目录存在
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+// 确保 proxies.json 存在
+if (!fs.existsSync(CONFIG_FILE)) fs.writeFileSync(CONFIG_FILE, JSON.stringify({ proxies: [] }, null, 2));
+
 function loadConfig() {
   try {
     return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
@@ -52,7 +57,11 @@ function loadConfig() {
 }
 
 function saveConfig(cfg) {
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2));
+  try {
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2));
+  } catch (e) {
+    console.error('[manager] 保存配置失败:', e.message);
+  }
 }
 
 function genId() {

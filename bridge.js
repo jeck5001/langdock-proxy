@@ -744,21 +744,47 @@ router.post('/v1/chat/completions', async (req, res) => {
 // 把 Anthropic tools 定义转成 prompt 指令
 function formatToolsForPrompt(tools) {
   if (!tools || !tools.length) return '';
-  let s = '\n\n--- AVAILABLE TOOLS ---\n';
-  s += 'When you need to use a tool, output EXACTLY this format (and nothing else for the tool call):\n\n';
-  s += '<tool_call>\n{"name":"ToolName","arguments":{"key":"value"}}\n</tool_call>\n\n';
-  s += 'Tools:\n\n';
+  let s = '';
+
+  // 工具定义
+  s += '<available_tools>\n';
   for (const t of tools) {
-    s += '### ' + t.name + '\n' + (t.description || '') + '\n';
     const schema = t.input_schema || t.inputSchema || {};
     const props = schema.properties || {};
     const req = schema.required || [];
-    for (const [k, v] of Object.entries(props)) {
-      s += '  - ' + k + (req.includes(k) ? '*' : '') + ': ' + (v.description || v.type || '');
+    s += `<tool name="${t.name}">\n`;
+    s += `  <description>${t.description || ''}</description>\n`;
+    if (Object.keys(props).length > 0) {
+      s += '  <parameters>\n';
+      for (const [k, v] of Object.entries(props)) {
+        s += `    <param name="${k}" type="${v.type || 'string'}" required="${req.includes(k)}" description="${v.description || ''}" />\n`;
+      }
+      s += '  </parameters>\n';
     }
-    s += '\n\n';
+    s += '</tool>\n';
   }
-  s += '---\n';
+  s += '</available_tools>\n\n';
+
+  // 调用指令
+  s += `<tool_calling_instructions>
+When you need to use a tool to answer the user's request, output the tool call in this EXACT format:
+
+<tool_call>
+{"name": "TOOL_NAME", "arguments": {"param": "value"}}
+</tool_call>
+
+Rules:
+1. You MUST use tools when asked to read files, write files, execute commands, search, etc.
+2. Output ONLY the <tool_call> block - no other text before or after
+3. Wait for the tool result before continuing
+4. NEVER make up file contents or command outputs
+
+Example - user asks "read /tmp/hello.txt":
+<tool_call>
+{"name": "Read", "arguments": {"file_path": "/tmp/hello.txt"}}
+</tool_call>
+</tool_calling_instructions>\n\n`;
+
   return s;
 }
 
@@ -775,13 +801,32 @@ function toToolUseBlocks(calls) {
 // 从文本解析工具调用
 function parseToolCalls(text) {
   const calls = [];
-  const re = /<tool_call>([\s\S]*?)<\/tool_call>/g;
+  // 匹配 <tool_call>...</tool_call>, 里面的 JSON 可能有换行
+  const re = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
   let m;
   while ((m = re.exec(text))) {
+    const jsonStr = m[1].trim();
     try {
-      const obj = JSON.parse(m[1].trim());
-      if (obj.name) calls.push({ name: obj.name, arguments: obj.arguments || {} });
-    } catch {}
+      const obj = JSON.parse(jsonStr);
+      if (obj.name) calls.push({ name: obj.name, arguments: obj.arguments || obj.input || {} });
+    } catch {
+      // 尝试从代码块里提取 JSON
+      const codeBlock = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
+      if (codeBlock) {
+        try {
+          const obj = JSON.parse(codeBlock[1].trim());
+          if (obj.name) calls.push({ name: obj.name, arguments: obj.arguments || obj.input || {} });
+        } catch {}
+      }
+      // 尝试宽松匹配第一个 {...}
+      const jsonMatch = jsonStr.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        try {
+          const obj = JSON.parse(jsonMatch[0]);
+          if (obj.name) calls.push({ name: obj.name, arguments: obj.arguments || obj.input || {} });
+        } catch {}
+      }
+    }
   }
   return calls;
 }
@@ -1142,4 +1187,17 @@ module.exports.getConfig = getConfig;
 module.exports.updateConfig = updateConfig;
 module.exports.callLangdock = callLangdock;
 module.exports.extractText = extractText;
+
+// 当直接运行 node bridge.js 时启动独立服务器
+if (require.main === module) {
+  const express = require('express');
+  const app = express();
+  app.use(express.json({ limit: '10mb' }));
+  app.use('/', router);
+  const p = process.env.BRIDGE_PORT || 8963;
+  app.listen(p, () => {
+    console.log(`Bridge standalone mode on :${p}`);
+    console.log(`  Cookie: ${config.langdockCookie ? 'configured' : 'NOT SET'}`);
+  });
+}
 module.exports.getModels = getModels;
