@@ -1108,17 +1108,26 @@ router.post('/v1/responses', async (req, res) => {
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
       const rid = 'resp_' + uuid().replace(/-/g, '');
-      const mk = (type, data) => `data: ${JSON.stringify({ type, ...data, id: rid })}\n\n`;
-      res.write(mk('response.created', { response: { id: rid, object: 'response', model: model || 'auto', status: 'in_progress' } }));
+      const sse = (type, data) => { res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`); };
+      const outIdx = 0;
+      const partId = 'part_' + uuid().replace(/-/g, '').slice(0, 12);
+      const itemId = 'item_' + uuid().replace(/-/g, '').slice(0, 12);
+
+      // 完整事件链 (Codex/Responses API 期望所有事件)
+      sse('response.created', { response: { id: rid, object: 'response', model: model || 'auto', status: 'in_progress', output: [] } });
+      sse('response.in_progress', { response: { id: rid, object: 'response', model: model || 'auto', status: 'in_progress' } });
+      sse('response.output_item.added', { output_index: 0, item: { id: itemId, type: 'message', role: 'assistant', status: 'in_progress', content: [] } });
+      sse('response.content_part.added', { output_index: 0, content_index: 0, part: { type: 'output_text', text: '' } });
 
       const outputChunks = [];
       await callLangdockWithRetry(messages, lm, true, (text) => {
         outputChunks.push(text);
-        res.write(mk('response.output_text.delta', { delta: text }));
+        sse('response.output_text.delta', { output_index: 0, content_index: 0, delta: text });
       });
 
-      res.write(mk('response.output_text.done', { text: '' }));
-      res.write(mk('response.completed', { response: { id: rid, object: 'response', model: model || 'auto', status: 'completed' } }));
+      sse('response.content_part.done', { output_index: 0, content_index: 0, part: { type: 'output_text', text: outputChunks.join('') } });
+      sse('response.output_item.done', { output_index: 0, item: { id: itemId, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: outputChunks.join('') }] } });
+      sse('response.completed', { response: { id: rid, object: 'response', model: model || 'auto', status: 'completed', output: [{ id: itemId, type: 'message', role: 'assistant', content: [{ type: 'output_text', text: outputChunks.join('') }] }] } });
       res.end();
 
       logEntry.status = 'success';
