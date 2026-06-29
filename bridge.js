@@ -792,7 +792,13 @@ router.post('/v1/chat/completions', async (req, res) => {
     });
     if (hasTools) {
       const toolPrompt = formatToolsForPromptOpenAI(tools);
-      msgs.unshift({ role: 'system', content: toolPrompt });
+      // 注入到最后一条 user 消息末尾 (近因效应: 压过客户端的大系统提示词)
+      const lastUserIdx = msgs.map((m, i) => m.role === 'user' ? i : -1).filter(i => i >= 0).pop();
+      if (lastUserIdx !== undefined && lastUserIdx >= 0) {
+        msgs[lastUserIdx] = { role: 'user', content: (msgs[lastUserIdx].content || '') + toolPrompt };
+      } else {
+        msgs.push({ role: 'user', content: toolPrompt });
+      }
     }
 
     const ld = await callLangdockWithRetry(msgs, lm);
@@ -1045,16 +1051,24 @@ router.post('/v1/messages', async (req, res) => {
     return { role: m.role, content: c };
   });
 
-  // 构造 system prompt: 原始 system + 工具描述
+  // 构造 system prompt: 原始 system
   let systemPrompt = '';
   if (system) {
     systemPrompt = typeof system === 'string' ? system :
       (Array.isArray(system) ? system.map(s => s.text || s.content || '').join('\n') : JSON.stringify(system));
   }
-  if (hasTools) {
-    systemPrompt += formatToolsForPrompt(tools);
-  }
   if (systemPrompt) msgs.unshift({ role: 'system', content: systemPrompt });
+
+  // 工具指令注入到最后一条 user 消息末尾 (近因效应: 压过客户端的大系统提示词)
+  if (hasTools) {
+    const toolPrompt = formatToolsForPrompt(tools);
+    const lastUserIdx = msgs.map((m, i) => m.role === 'user' ? i : -1).filter(i => i >= 0).pop();
+    if (lastUserIdx !== undefined && lastUserIdx >= 0) {
+      msgs[lastUserIdx] = { role: 'user', content: (msgs[lastUserIdx].content || '') + toolPrompt };
+    } else {
+      msgs.push({ role: 'user', content: toolPrompt });
+    }
+  }
 
   const logEntry = {
     endpoint: '/v1/messages',
@@ -1214,16 +1228,15 @@ router.post('/v1/responses', async (req, res) => {
 
   const hasTools = tools && tools.length > 0;
 
-  // 有工具时: 自动预执行, 获取项目上下文拼到消息里
-  // 这样模型不需要做 tool calling, 直接基于真实数据回答
+  // 有工具时: 把工具指令拼到最后一条 user 消息末尾 (近因效应, 压过 Codex 的大系统提示词)
+  // 模型输出 function_call JSON → bridge 转成 SSE function_call → Codex 在本地 Mac 执行
   if (hasTools) {
-    const lastUserMsg = messages.filter(m => m.role === 'user').pop();
-    if (lastUserMsg) {
-      const autoContext = autoExecuteContext(lastUserMsg.content, tools);
-      if (autoContext) {
-        lastUserMsg.content += autoContext;
-        log('[bridge:codex] 已预执行工具获取上下文, 拼入消息');
-      }
+    const toolPrompt = formatToolsForPromptOpenAI(tools);
+    const lastUserIdx = messages.map((m, i) => m.role === 'user' ? i : -1).filter(i => i >= 0).pop();
+    if (lastUserIdx !== undefined && lastUserIdx >= 0) {
+      messages[lastUserIdx].content = (messages[lastUserIdx].content || '') + toolPrompt;
+    } else {
+      messages.push({ role: 'user', content: toolPrompt });
     }
   }
 
@@ -1244,89 +1257,74 @@ router.post('/v1/responses', async (req, res) => {
     logEntry.model = lm.displayName || lm.providerModelId || model;
     logEntry.modelId = lm.id;
 
-    // 所有请求统一走流式 (Codex 期望 SSE)
-    if (stream) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
-      const rid = 'resp_' + uuid().replace(/-/g, '');
-      const sse = (type, data) => { res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`); };
-      const outIdx = 0;
-      const partId = 'part_' + uuid().replace(/-/g, '').slice(0, 12);
-      const itemId = 'item_' + uuid().replace(/-/g, '').slice(0, 12);
+    // 统一: 先非流式调 Langdock 拿完整文本 (才能解析 function_call),
+    // 再通过 SSE 流返回给 Codex。function_call 由 Codex 在本地 Mac 执行。
+    const rid = 'resp_' + uuid().replace(/-/g, '');
+    const itemId = 'item_' + uuid().replace(/-/g, '').slice(0, 12);
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    const sse = (type, data) => { res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`); };
 
-      // 完整事件链 (Codex/Responses API 期望所有事件)
-      sse('response.created', { response: { id: rid, object: 'response', model: model || 'auto', status: 'in_progress', output: [] } });
-      sse('response.in_progress', { response: { id: rid, object: 'response', model: model || 'auto', status: 'in_progress' } });
+    sse('response.created', { response: { id: rid, object: 'response', model: model || 'auto', status: 'in_progress', output: [] } });
+    sse('response.in_progress', { response: { id: rid, object: 'response', model: model || 'auto', status: 'in_progress' } });
+
+    const ld = await callLangdockWithRetry(messages, lm);
+    const text = extractText(ld);
+    logEntry.duration = Date.now() - startTime;
+
+    if (ld.status >= 400) {
+      logEntry.status = 'error';
+      logEntry.error = 'Langdock: ' + ld.body.slice(0, 200);
+      addCallLog(logEntry);
       sse('response.output_item.added', { output_index: 0, item: { id: itemId, type: 'message', role: 'assistant', status: 'in_progress', content: [] } });
       sse('response.content_part.added', { output_index: 0, content_index: 0, part: { type: 'output_text', text: '' } });
+      sse('response.output_text.delta', { output_index: 0, content_index: 0, delta: 'Error: ' + ld.body.slice(0, 200) });
+      sse('response.content_part.done', { output_index: 0, content_index: 0, part: { type: 'output_text', text: 'Error' } });
+      sse('response.output_item.done', { output_index: 0, item: { id: itemId, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'Error' }] } });
+      sse('response.completed', { response: { id: rid, object: 'response', model: model || 'auto', status: 'completed', output: [] } });
+      return res.end();
+    }
 
-      const outputChunks = [];
-      await callLangdockWithRetry(messages, lm, true, (text) => {
-        outputChunks.push(text);
-        sse('response.output_text.delta', { output_index: 0, content_index: 0, delta: text });
+    // 检测 function_call → 通过 SSE 返回 function_call 输出项, Codex 本地执行
+    const calls = hasTools ? parseToolCalls(text) : [];
+    if (calls.length > 0) {
+      const toolCalls = toOpenAIToolCalls(calls);
+      log(`[bridge:codex] 返回 function_call via SSE: ${calls.map(c => c.name).join(', ')}`);
+      const output = [];
+      calls.forEach((c, i) => {
+        const iid = i === 0 ? itemId : 'item_' + uuid().replace(/-/g, '').slice(0, 12);
+        const callId = toolCalls[i].id;
+        const argsStr = toolCalls[i].function.arguments;
+        sse('response.output_item.added', { output_index: i, item: { id: iid, type: 'function_call', name: c.name, call_id: callId, arguments: '', status: 'in_progress' } });
+        sse('response.function_call_arguments.delta', { output_index: i, item_id: iid, call_id: callId, delta: argsStr });
+        sse('response.function_call_arguments.done', { output_index: i, item_id: iid, call_id: callId, arguments: argsStr });
+        sse('response.output_item.done', { output_index: i, item: { id: iid, type: 'function_call', name: c.name, call_id: callId, arguments: argsStr, status: 'completed' } });
+        output.push({ id: iid, type: 'function_call', name: c.name, call_id: callId, arguments: argsStr, status: 'completed' });
       });
-
-      sse('response.content_part.done', { output_index: 0, content_index: 0, part: { type: 'output_text', text: outputChunks.join('') } });
-      sse('response.output_item.done', { output_index: 0, item: { id: itemId, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: outputChunks.join('') }] } });
-      sse('response.completed', { response: { id: rid, object: 'response', model: model || 'auto', status: 'completed', output: [{ id: itemId, type: 'message', role: 'assistant', content: [{ type: 'output_text', text: outputChunks.join('') }] }] } });
+      sse('response.completed', { response: { id: rid, object: 'response', model: model || 'auto', status: 'completed', output } });
       res.end();
 
       logEntry.status = 'success';
-      logEntry.duration = Date.now() - startTime;
-      logEntry.outputText = outputChunks.join('');
-      logEntry.responsePreview = logEntry.outputText.slice(0, 200);
-    } else {
-      // 非流式: 服务端 Agent 循环 (Codex)
-      const MAX_TURNS = 10;
-      for (let turn = 0; turn < MAX_TURNS; turn++) {
-        const ld = await callLangdockWithRetry(messages, lm);
-        const text = extractText(ld);
-        logEntry.duration = Date.now() - startTime;
-
-        if (ld.status >= 400) {
-          logEntry.status = 'error';
-          logEntry.error = 'Langdock: ' + ld.body.slice(0, 200);
-          addCallLog(logEntry);
-          return res.status(ld.status).json({ error: { message: 'Langdock: ' + ld.body.slice(0, 500), type: 'upstream_error' } });
-        }
-
-        if (hasTools) {
-          const calls = parseToolCalls(text);
-          if (calls.length > 0) {
-            for (const c of calls) {
-              log(`[agent:codex] 执行工具: ${c.name}(${JSON.stringify(c.arguments).slice(0,100)})`);
-              const result = executeTool(c.name, c.arguments);
-              messages.push({ role: 'assistant', content: '{"function_call":{"name":"' + c.name + '","arguments":' + JSON.stringify(c.arguments) + '}}' });
-              messages.push({ role: 'user', content: '[tool_result]\n' + JSON.stringify(result) });
-            }
-            log(`[agent:codex] turn ${turn+1}: 执行了 ${calls.length} 个工具`);
-            continue;
-          }
-        }
-
-        // 最终答案
-        logEntry.status = 'success';
-        logEntry.outputText = text;
-        logEntry.responsePreview = text.slice(0, 200);
-        addCallLog(logEntry);
-        addConversation({ title: messages[messages.length - 1]?.content?.slice(0, 50) || '新对话', model: logEntry.model, messages, response: text, endpoint: 'responses' });
-        return res.json({
-          id: 'resp_' + uuid().replace(/-/g, ''),
-          object: 'response',
-          created_at: Math.floor(Date.now() / 1000),
-          model: model || 'auto',
-          output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] }],
-          status: 'completed',
-        });
-      }
-      // 超出上限
-      logEntry.status = 'error';
-      logEntry.error = 'agent loop exceeded max turns';
+      logEntry.outputText = '(function_call: ' + calls.map(c => c.name).join(', ') + ')';
+      logEntry.responsePreview = logEntry.outputText;
       addCallLog(logEntry);
-      return res.status(500).json({ error: { message: 'Agent loop exceeded max turns' } });
+      return;
     }
 
+    // 普通文本 → 逐块 SSE 返回
+    sse('response.output_item.added', { output_index: 0, item: { id: itemId, type: 'message', role: 'assistant', status: 'in_progress', content: [] } });
+    sse('response.content_part.added', { output_index: 0, content_index: 0, part: { type: 'output_text', text: '' } });
+    const chunks = text.match(/[\s\S]{1,20}/g) || [text];
+    for (const chunk of chunks) sse('response.output_text.delta', { output_index: 0, content_index: 0, delta: chunk });
+    sse('response.content_part.done', { output_index: 0, content_index: 0, part: { type: 'output_text', text } });
+    sse('response.output_item.done', { output_index: 0, item: { id: itemId, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text }] } });
+    sse('response.completed', { response: { id: rid, object: 'response', model: model || 'auto', status: 'completed', output: [{ id: itemId, type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] }] } });
+    res.end();
+
+    logEntry.status = 'success';
+    logEntry.outputText = text;
+    logEntry.responsePreview = text.slice(0, 200);
     addCallLog(logEntry);
     addConversation({
       title: messages[messages.length - 1]?.content?.slice(0, 50) || '新对话',
